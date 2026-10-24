@@ -155,9 +155,11 @@ static void init() {
 }
 
 struct MoveList {
-    Move m[256];
+    Move m[512];  // с запасом: в своей расстановке может быть много ферзей
     int n = 0;
-    void add(Move x) { m[n++] = x; }
+    void add(Move x) {
+        if (n < 512) m[n++] = x;
+    }
 };
 
 struct Undo {
@@ -892,7 +894,7 @@ struct Searcher {
         if (stand > alpha) alpha = stand;
         MoveList ml;
         b.gen(ml, true);
-        int sc[256];
+        int sc[512];
         for (int i = 0; i < ml.n; i++) sc[i] = scoreMove(ml.m[i], 0, ply);
         for (int i = 0; i < ml.n; i++) {
             pickNext(ml, sc, i);
@@ -957,7 +959,7 @@ struct Searcher {
 
         MoveList ml;
         b.gen(ml, false);
-        int sc[256];
+        int sc[512];
         for (int i = 0; i < ml.n; i++) sc[i] = scoreMove(ml.m[i], ttMove, ply);
         int best = -INF;
         Move bestM = 0;
@@ -1121,6 +1123,38 @@ static Move think(const Board &rb, const std::vector<uint64_t> &hist, int level,
     return res;
 }
 
+// Оценка позиции для разбора: счёт с точки зрения того, кто ходит, и лучший ход
+static int analyse(const Board &rb, const std::vector<uint64_t> &hist, Uint32 timeMs, int maxDepth,
+                   std::atomic<bool> *stop, Move *best) {
+    Searcher *S = new Searcher();
+    S->b = rb;
+    S->path = hist;
+    if (S->path.empty() || S->path.back() != rb.hash) S->path.push_back(rb.hash);
+    S->stopFlag = stop;
+    S->start = SDL_GetTicks();
+    S->limit = timeMs;
+    MoveList ml;
+    S->b.genLegal(ml);
+    int score = 0;
+    Move bm = 0;
+    if (ml.n == 0) {
+        score = S->b.inCheck(S->b.side) ? -MATE : 0;
+    } else {
+        for (int d = 1; d <= maxDepth; d++) {
+            S->rootBest = 0;
+            int sc = S->negamax(d, -INF, INF, 0, false);
+            if (S->aborted) break;
+            score = sc;
+            bm = S->rootBest;
+            if (std::abs(sc) > MATE - 100) break;
+        }
+        if (!bm) bm = ml.m[0];
+    }
+    delete S;
+    if (best) *best = bm;
+    return score;
+}
+
 }  // namespace eng
 
 // =====================================================================
@@ -1136,9 +1170,18 @@ struct Game {
     std::vector<std::string> san;
     std::vector<uint64_t> hashes;
     int result = RES_NONE, reason = R_NONE, loser = -1;
+    std::string startFen;  // своя начальная позиция (пусто — обычная)
+    int startSide = eng::WHITE;
+    int off() const { return startSide == eng::BLACK ? 1 : 0; }  // сдвиг нумерации ходов
 
-    void reset() {
-        cur.setStart();
+    void reset(const std::string &fen = std::string()) {
+        if (fen.empty() || !cur.setFEN(fen)) {
+            cur.setStart();
+            startFen.clear();
+        } else {
+            startFen = fen;
+        }
+        startSide = cur.side;
         before.clear();
         moves.clear();
         san.clear();
@@ -1499,7 +1542,7 @@ static const GlyphDef GLYPHS[] = {
     {'d', {"....#", "....#", ".####", "#...#", "#...#", "#...#", ".####"}},
     {'e', {".....", ".....", ".###.", "#...#", "#####", "#....", ".###."}},
     {'f', {"..##.", ".#...", ".#...", "###..", ".#...", ".#...", ".#..."}},
-    {'g', {".....", ".####", "#...#", "#...#", ".####", "....#", ".###."}},
+    {'g', {".....", ".....", ".####", "#...#", ".####", "....#", "####."}},
     {'h', {"#....", "#....", "####.", "#...#", "#...#", "#...#", "#...#"}},
     {'x', {".....", ".....", "#...#", ".#.#.", "..#..", ".#.#.", "#...#"}},
     // --- знаки ---
@@ -1509,6 +1552,8 @@ static const GlyphDef GLYPHS[] = {
     {'=', {".....", ".....", "####.", ".....", "####.", ".....", "....."}},
     {'.', {".....", ".....", ".....", ".....", ".....", "##...", "##..."}},
     {',', {".....", ".....", ".....", ".....", "##...", ".#...", "#...."}},
+    {'>', {".....", "#....", ".#...", "..#..", ".#...", "#....", "....."}},
+    {'<', {".....", "..#..", ".#...", "#....", ".#...", "..#..", "....."}},
     {';', {".....", "##...", "##...", ".....", "##...", ".#...", "#...."}},
     {':', {".....", "##...", "##...", ".....", "##...", "##...", "....."}},
     {'!', {"#....", "#....", "#....", "#....", "#....", ".....", "#...."}},
@@ -1803,6 +1848,432 @@ static void drawPieceShape(int color, int type, float x, float y, float s, bool 
     for (auto &d : G.dots) fillCircle(x + d.x * s, y + d.y * s, d.r * s, detail);
 }
 
+// ---------- классические фигуры (векторные) ----------
+// Контуры повторяют свободный набор шахматных фигур Colin M.L. Burnett
+// (Wikimedia Commons, лицензии BSD / GPL / GFDL). Поле 45x45 единиц,
+// заливка + обводка 1.5, растеризация в коде со сглаживанием.
+struct VPt {
+    float x, y;
+};
+struct VSub {
+    std::vector<VPt> p;
+    bool closed;
+};
+struct VShape {
+    const char *d;
+    char fill;    // 'W' белый, 'B' чёрный, 'L' светло-серый, 0 — нет
+    char stroke;  // то же
+    float sw;     // толщина обводки
+    bool roundCap;
+    bool useM;
+    float m[6];   // матрица (a,b,c,d,e,f) как в SVG
+};
+#define VS(d, f, s, w, rc) {d, f, s, w, rc, false, {1, 0, 0, 1, 0, 0}}
+
+static const char *VP_PAWN =
+    "m 22.5,9 c -2.21,0 -4,1.79 -4,4 0,0.89 0.29,1.71 0.78,2.38 C 17.33,16.5 16,18.59 16,21 c 0,2.03 0.94,3.84 "
+    "2.41,5.03 C 15.41,27.09 11,31.58 11,39.5 H 34 C 34,31.58 29.59,27.09 26.59,26.03 28.06,24.84 29,23.03 29,21 "
+    "29,18.59 27.67,16.5 25.72,15.38 26.21,14.71 26.5,13.89 26.5,13 c 0,-2.21 -1.79,-4 -4,-4 z";
+static const char *VP_N_BODY = "M 22,10 C 32.5,11 38.5,18 38,39 L 15,39 C 15,30 25,32.5 23,18";
+static const char *VP_N_HEAD =
+    "M 24,18 C 24.38,20.91 18.45,25.37 16,27 C 13,29 13.18,31.34 11,31 C 9.958,30.06 12.41,27.96 11,28 C 10,28 "
+    "11.19,29.23 10,30 C 9,30 5.997,31 6,26 C 6,24 12,14 12,14 C 12,14 13.89,12.1 14,10.5 C 13.27,9.506 13.5,8.5 "
+    "13.5,7.5 C 14.5,6.5 16.5,10 16.5,10 L 18.5,10 C 18.5,10 19.28,8.008 21,7 C 22,7 22,10 22,10";
+static const char *VP_N_NOSE = "M 9.5 25.5 A 0.5 0.5 0 1 1 8.5,25.5 A 0.5 0.5 0 1 1 9.5 25.5 z";
+static const char *VP_N_EYE = "M 15 15.5 A 0.5 1.5 0 1 1 14,15.5 A 0.5 1.5 0 1 1 15 15.5 z";
+static const char *VP_N_MANE =
+    "M 24.55,10.4 L 24.1,11.85 L 24.6,12 C 27.75,13 30.25,14.49 32.5,18.75 C 34.75,23.01 35.75,29.06 35.25,39 "
+    "L 35.2,39.5 L 37.45,39.5 L 37.5,39 C 38,28.94 36.62,22.15 34.25,17.66 C 31.88,13.17 28.46,11.02 25.06,10.5 "
+    "L 24.55,10.4 z";
+static const char *VP_B_BASE =
+    "M 9,36 C 12.39,35.03 19.11,36.43 22.5,34 C 25.89,36.43 32.61,35.03 36,36 C 36,36 37.65,36.54 39,38 C 38.32,"
+    "38.97 37.35,38.99 36,38.5 C 32.61,37.53 25.89,38.96 22.5,37.5 C 19.11,38.96 12.39,37.53 9,38.5 C 7.65,38.99 "
+    "6.68,38.97 6,38 C 7.35,36.54 9,36 9,36 z";
+static const char *VP_B_BODY =
+    "M 15,32 C 17.5,34.5 27.5,34.5 30,32 C 30.5,30.5 30,30 30,30 C 30,27.5 27.5,26 27.5,26 C 33,24.5 33.5,14.5 "
+    "22.5,10.5 C 11.5,14.5 12,24.5 17.5,26 C 17.5,26 15,27.5 15,30 C 15,30 14.5,30.5 15,32 z";
+static const char *VP_B_BALL = "M 25 8 A 2.5 2.5 0 1 1 20,8 A 2.5 2.5 0 1 1 25 8 z";
+static const char *VP_B_LINES = "M 17.5,26 L 27.5,26 M 15,30 L 30,30 M 22.5,15.5 L 22.5,20.5 M 20,18 L 25,18";
+static const char *VP_R_BASE = "M 9,39 L 36,39 L 36,36 L 9,36 L 9,39 z";
+static const char *VP_R_BASE2 = "M 12,36 L 12,32 L 33,32 L 33,36 L 12,36 z";
+static const char *VP_R_TOP = "M 11,14 L 11,9 L 15,9 L 15,11 L 20,11 L 20,9 L 25,9 L 25,11 L 30,11 L 30,9 L 34,9 L 34,14";
+static const char *VP_Q_CROWN =
+    "M 9,26 C 17.5,24.5 30,24.5 36,26 L 38.5,13.5 L 31,25 L 30.7,10.9 L 25.5,24.5 L 22.5,10 L 19.5,24.5 L 14.3,"
+    "10.9 L 14,25 L 6.5,13.5 L 9,26 z";
+static const char *VP_Q_BODY =
+    "M 9,26 C 9,28 10.5,28 11.5,30 C 12.5,31.5 12.5,31 12,33.5 C 10.5,34.5 11,36 11,36 C 9.5,37.5 11,38.5 11,"
+    "38.5 C 17.5,39.5 27.5,39.5 34,38.5 C 34,38.5 35.5,37.5 34,36 C 34,36 34.5,34.5 33,33.5 C 32.5,31 32.5,31.5 "
+    "33.5,30 C 34.5,28 36,28 36,26 C 27.5,24.5 17.5,24.5 9,26 z";
+static const char *VP_Q_BALLS =
+    "M 8,12 A 2,2 0 1 1 4,12 A 2,2 0 1 1 8,12 z M 16,9 A 2,2 0 1 1 12,9 A 2,2 0 1 1 16,9 z "
+    "M 24.5,8 A 2,2 0 1 1 20.5,8 A 2,2 0 1 1 24.5,8 z M 33,9 A 2,2 0 1 1 29,9 A 2,2 0 1 1 33,9 z "
+    "M 41,12 A 2,2 0 1 1 37,12 A 2,2 0 1 1 41,12 z";
+static const char *VP_K_CROSS = "M 22.5,11.63 L 22.5,6 M 20,8 L 25,8";
+static const char *VP_K_TOP =
+    "M 22.5,25 C 22.5,25 27,17.5 25.5,14.5 C 25.5,14.5 24.5,12 22.5,12 C 20.5,12 19.5,14.5 19.5,14.5 C 18,17.5 "
+    "22.5,25 22.5,25";
+static const char *VP_K_BODY =
+    "M 12.5,37 C 18,40.5 27,40.5 32.5,37 L 32.5,30 C 32.5,30 41.5,25.5 38.5,19.5 C 34.5,13 25,16 22.5,23.5 L "
+    "22.5,27 L 22.5,23.5 C 20,16 10.5,13 6.5,19.5 C 3.5,25.5 12.5,30 12.5,30 L 12.5,37";
+static const char *VP_K_BANDS =
+    "M 12.5,30 C 18,27 27,27 32.5,30 M 12.5,33.5 C 18,30.5 27,30.5 32.5,33.5 M 12.5,37 C 18,34 27,34 32.5,37";
+
+// Набор фигур: [цвет][тип], смещение группы по y (как в оригинале)
+struct VPiece {
+    std::vector<VShape> shapes;
+    float dy;
+};
+static VPiece gVP[2][7];
+
+static void vpiecesInit() {
+    const float EYE_M[6] = {0.866f, 0.5f, -0.5f, 0.866f, 9.693f, -5.173f};
+    auto eye = [&](char col) {
+        VShape s = VS(VP_N_EYE, col, col, 1.5f, true);
+        s.useM = true;
+        for (int i = 0; i < 6; i++) s.m[i] = EYE_M[i];
+        return s;
+    };
+    // белые
+    gVP[0][eng::PAWN] = {{VS(VP_PAWN, 'W', 'B', 1.5f, true)}, 0};
+    gVP[0][eng::KNIGHT] = {{VS(VP_N_BODY, 'W', 'B', 1.5f, true), VS(VP_N_HEAD, 'W', 'B', 1.5f, true),
+                            VS(VP_N_NOSE, 'B', 'B', 1.5f, true), eye('B')}, 0.3f};
+    gVP[0][eng::BISHOP] = {{VS(VP_B_BASE, 'W', 'B', 1.5f, false), VS(VP_B_BODY, 'W', 'B', 1.5f, false),
+                            VS(VP_B_BALL, 'W', 'B', 1.5f, false), VS(VP_B_LINES, 0, 'B', 1.5f, true)}, 0.6f};
+    gVP[0][eng::ROOK] = {{VS(VP_R_BASE, 'W', 'B', 1.5f, false), VS(VP_R_BASE2, 'W', 'B', 1.5f, false),
+                          VS(VP_R_TOP, 'W', 'B', 1.5f, false), VS("M 34,14 L 31,17 L 14,17 L 11,14", 'W', 'B', 1.5f, true),
+                          VS("M 31,17 L 31,29.5 L 14,29.5 L 14,17", 'W', 'B', 1.5f, false),
+                          VS("M 31,29.5 L 32.5,32 L 12.5,32 L 14,29.5", 'W', 'B', 1.5f, true),
+                          VS("M 11,14 L 34,14", 0, 'B', 1.5f, true)}, 0.3f};
+    gVP[0][eng::QUEEN] = {{VS(VP_Q_CROWN, 'W', 'B', 1.5f, false), VS(VP_Q_BODY, 'W', 'B', 1.5f, false),
+                           VS("M 11.5,30 C 15,29 30,29 33.5,30", 0, 'B', 1.5f, false),
+                           VS("M 12,33.5 C 18,32.5 27,32.5 33,33.5", 0, 'B', 1.5f, false),
+                           VS(VP_Q_BALLS, 'W', 'B', 1.5f, false)}, 0};
+    gVP[0][eng::KING] = {{VS(VP_K_CROSS, 0, 'B', 1.5f, true), VS(VP_K_TOP, 'W', 'B', 1.5f, false),
+                          VS(VP_K_BODY, 'W', 'B', 1.5f, true), VS(VP_K_BANDS, 0, 'B', 1.5f, true)}, 0};
+    // чёрные
+    gVP[1][eng::PAWN] = {{VS(VP_PAWN, 'B', 'B', 1.5f, true)}, 0};
+    gVP[1][eng::KNIGHT] = {{VS(VP_N_BODY, 'B', 'B', 1.5f, true), VS(VP_N_HEAD, 'B', 'B', 1.5f, true),
+                            VS(VP_N_NOSE, 'L', 'L', 1.5f, true), eye('L'), VS(VP_N_MANE, 'L', 0, 0, false)}, 0.3f};
+    gVP[1][eng::BISHOP] = {{VS(VP_B_BASE, 'B', 'B', 1.5f, false), VS(VP_B_BODY, 'B', 'B', 1.5f, false),
+                            VS(VP_B_BALL, 'B', 'B', 1.5f, false), VS(VP_B_LINES, 0, 'W', 1.5f, true)}, 0.6f};
+    gVP[1][eng::ROOK] = {{VS(VP_R_BASE, 'B', 'B', 1.5f, false),
+                          VS("M 12.5,32 L 14,29.5 L 31,29.5 L 32.5,32 L 12.5,32 z", 'B', 'B', 1.5f, false),
+                          VS(VP_R_BASE2, 'B', 'B', 1.5f, false),
+                          VS("M 14,29.5 L 14,16.5 L 31,16.5 L 31,29.5 L 14,29.5 z", 'B', 'B', 1.5f, false),
+                          VS("M 14,16.5 L 11,14 L 34,14 L 31,16.5 L 14,16.5 z", 'B', 'B', 1.5f, false),
+                          VS("M 11,14 L 11,9 L 15,9 L 15,11 L 20,11 L 20,9 L 25,9 L 25,11 L 30,11 L 30,9 L 34,9 L 34,14 L 11,14 z", 'B', 'B', 1.5f, false),
+                          VS("M 12,35.5 L 33,35.5", 0, 'W', 1.0f, false), VS("M 13,31.5 L 32,31.5", 0, 'W', 1.0f, false),
+                          VS("M 14,29.5 L 31,29.5", 0, 'W', 1.0f, false), VS("M 14,16.5 L 31,16.5", 0, 'W', 1.0f, false),
+                          VS("M 11,14 L 34,14", 0, 'W', 1.0f, false)}, 0.3f};
+    gVP[1][eng::QUEEN] = {{VS(VP_Q_CROWN, 'B', 'B', 1.5f, false), VS(VP_Q_BODY, 'B', 'B', 1.5f, true),
+                           VS(VP_Q_BALLS, 'B', 'B', 1.5f, true),
+                           VS("M 11,38.5 A 35,35 1 0 0 34,38.5", 0, 'B', 1.5f, false),
+                           VS("M 11,29 A 35,35 1 0 1 34,29", 0, 'W', 1.5f, true),
+                           VS("M 12.5,31.5 L 32.5,31.5", 0, 'W', 1.5f, true),
+                           VS("M 11.5,34.5 A 35,35 1 0 0 33.5,34.5", 0, 'W', 1.5f, true),
+                           VS("M 10.5,37.5 A 35,35 1 0 0 34.5,37.5", 0, 'W', 1.5f, true)}, 0};
+    gVP[1][eng::KING] = {{VS(VP_K_CROSS, 0, 'B', 1.5f, true), VS(VP_K_TOP, 'B', 'B', 1.5f, false),
+                          VS(VP_K_BODY, 'B', 'B', 1.5f, true),
+                          VS("M 32,29.5 C 32,29.5 40.5,25.5 38.03,19.85 C 34.15,14 25,18 22.5,24.5 L 22.5,26.6 L 22.5,"
+                             "24.5 C 20,18 10.85,14 6.97,19.85 C 4.5,25.5 13,29.5 13,29.5", 0, 'W', 1.5f, true),
+                          VS(VP_K_BANDS, 0, 'W', 1.5f, true)}, 0};
+}
+
+// --- разбор пути SVG ---
+static void arcPts(std::vector<VPt> &out, float x1, float y1, float rx, float ry, float phiDeg, int fa, int fs, float x2,
+                   float y2) {
+    if (rx == 0 || ry == 0) {
+        out.push_back({x2, y2});
+        return;
+    }
+    double phi = phiDeg * 3.14159265358979 / 180.0, c = std::cos(phi), s = std::sin(phi);
+    double dx = (x1 - x2) / 2.0, dy = (y1 - y2) / 2.0;
+    double xp = c * dx + s * dy, yp = -s * dx + c * dy;
+    double Rx = std::fabs(rx), Ry = std::fabs(ry);
+    double lam = xp * xp / (Rx * Rx) + yp * yp / (Ry * Ry);
+    if (lam > 1) {
+        Rx *= std::sqrt(lam);
+        Ry *= std::sqrt(lam);
+    }
+    double num = Rx * Rx * Ry * Ry - Rx * Rx * yp * yp - Ry * Ry * xp * xp;
+    double den = Rx * Rx * yp * yp + Ry * Ry * xp * xp;
+    double co = den > 0 ? std::sqrt(std::max(0.0, num / den)) : 0;
+    if (fa == fs) co = -co;
+    double cxp = co * Rx * yp / Ry, cyp = -co * Ry * xp / Rx;
+    double cx = c * cxp - s * cyp + (x1 + x2) / 2.0, cy = s * cxp + c * cyp + (y1 + y2) / 2.0;
+    auto ang = [](double ux, double uy, double vx, double vy) {
+        double a = std::atan2(ux * vy - uy * vx, ux * vx + uy * vy);
+        return a;
+    };
+    double th1 = ang(1, 0, (xp - cxp) / Rx, (yp - cyp) / Ry);
+    double dth = ang((xp - cxp) / Rx, (yp - cyp) / Ry, (-xp - cxp) / Rx, (-yp - cyp) / Ry);
+    if (!fs && dth > 0) dth -= 2 * 3.14159265358979;
+    else if (fs && dth < 0) dth += 2 * 3.14159265358979;
+    int n = 28;
+    for (int i = 1; i <= n; i++) {
+        double t = th1 + dth * i / n;
+        out.push_back({(float)(cx + Rx * std::cos(t) * c - Ry * std::sin(t) * s),
+                       (float)(cy + Rx * std::cos(t) * s + Ry * std::sin(t) * c)});
+    }
+}
+
+static void parsePath(const char *d, std::vector<VSub> &out) {
+    const char *p = d;
+    char cmd = 0;
+    float cx = 0, cy = 0, sx = 0, sy = 0, lcx = 0, lcy = 0;
+    bool haveSub = false;
+    auto skip = [&]() {
+        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;
+    };
+    auto num = [&](float &v) -> bool {
+        skip();
+        if (!*p || ((*p < '0' || *p > '9') && *p != '-' && *p != '+' && *p != '.')) return false;
+        char *e = nullptr;
+        v = strtof(p, &e);
+        if (e == p) return false;
+        p = e;
+        return true;
+    };
+    auto cur = [&]() -> VSub & {
+        if (!haveSub) {
+            VSub s;
+            s.closed = false;
+            s.p.push_back({cx, cy});
+            out.push_back(s);
+            haveSub = true;
+        }
+        return out.back();
+    };
+    for (;;) {
+        skip();
+        if (!*p) break;
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) cmd = *p++;
+        else if (!cmd) break;
+        bool rel = cmd >= 'a';
+        char C = (char)(rel ? cmd - 32 : cmd);
+        float ox = rel ? cx : 0, oy = rel ? cy : 0;
+        if (C == 'Z') {
+            if (haveSub) out.back().closed = true;
+            cx = sx;
+            cy = sy;
+            haveSub = false;
+            lcx = cx;
+            lcy = cy;
+            cmd = 0;
+            continue;
+        }
+        if (C == 'M') {
+            float x, y;
+            if (!num(x) || !num(y)) break;
+            cx = ox + x;
+            cy = oy + y;
+            sx = cx;
+            sy = cy;
+            haveSub = false;
+            cur();
+            lcx = cx;
+            lcy = cy;
+            cmd = rel ? 'l' : 'L';
+        } else if (C == 'L') {
+            float x, y;
+            if (!num(x) || !num(y)) break;
+            VSub &s = cur();
+            cx = ox + x;
+            cy = oy + y;
+            s.p.push_back({cx, cy});
+            lcx = cx;
+            lcy = cy;
+        } else if (C == 'H' || C == 'V') {
+            float v;
+            if (!num(v)) break;
+            VSub &s = cur();
+            if (C == 'H') cx = (rel ? cx : 0) + v;
+            else cy = (rel ? cy : 0) + v;
+            s.p.push_back({cx, cy});
+            lcx = cx;
+            lcy = cy;
+        } else if (C == 'C' || C == 'S') {
+            float x1, y1, x2, y2, x, y;
+            if (C == 'C') {
+                if (!num(x1) || !num(y1)) break;
+                x1 += ox;
+                y1 += oy;
+            } else {
+                x1 = 2 * cx - lcx;
+                y1 = 2 * cy - lcy;
+            }
+            if (!num(x2) || !num(y2) || !num(x) || !num(y)) break;
+            x2 += ox; y2 += oy; x += ox; y += oy;
+            VSub &s = cur();
+            int n = 20;
+            for (int i = 1; i <= n; i++) {
+                float t = (float)i / n, u = 1 - t;
+                float a = u * u * u, b = 3 * u * u * t, c2 = 3 * u * t * t, e = t * t * t;
+                s.p.push_back({a * cx + b * x1 + c2 * x2 + e * x, a * cy + b * y1 + c2 * y2 + e * y});
+            }
+            lcx = x2;
+            lcy = y2;
+            cx = x;
+            cy = y;
+        } else if (C == 'A') {
+            float rx, ry, rot, fa, fs, x, y;
+            if (!num(rx) || !num(ry) || !num(rot) || !num(fa) || !num(fs) || !num(x) || !num(y)) break;
+            VSub &s = cur();
+            arcPts(s.p, cx, cy, rx, ry, rot, fa != 0, fs != 0, ox + x, oy + y);
+            cx = ox + x;
+            cy = oy + y;
+            lcx = cx;
+            lcy = cy;
+        } else {
+            break;  // другие команды в наших контурах не встречаются
+        }
+    }
+}
+
+// --- растеризация в RGBA-буфер с суперсэмплингом ---
+struct VRaster {
+    int W, H;
+    std::vector<uint32_t> px;  // 0 — прозрачно, иначе 0xFF000000 | rgb
+};
+
+static void vFillPolys(VRaster &r, const std::vector<std::vector<VPt>> &polys, uint32_t col) {
+    struct E {
+        float x0, y0, x1, y1;
+        int dir;
+    };
+    std::vector<E> es;
+    float ymin = 1e9f, ymax = -1e9f;
+    for (auto &pl : polys) {
+        size_t n = pl.size();
+        if (n < 2) continue;
+        for (size_t i = 0; i < n; i++) {
+            VPt a = pl[i], b = pl[(i + 1) % n];
+            if (a.y == b.y) continue;
+            E e;
+            if (a.y < b.y) { e.x0 = a.x; e.y0 = a.y; e.x1 = b.x; e.y1 = b.y; e.dir = 1; }
+            else { e.x0 = b.x; e.y0 = b.y; e.x1 = a.x; e.y1 = a.y; e.dir = -1; }
+            es.push_back(e);
+            ymin = std::min(ymin, e.y0);
+            ymax = std::max(ymax, e.y1);
+        }
+    }
+    if (es.empty()) return;
+    int y0 = std::max(0, (int)std::floor(ymin)), y1 = std::min(r.H - 1, (int)std::ceil(ymax));
+    std::vector<std::pair<float, int>> xs;
+    for (int y = y0; y <= y1; y++) {
+        float sy = y + 0.5f;
+        xs.clear();
+        for (auto &e : es)
+            if (sy >= e.y0 && sy < e.y1) xs.push_back({e.x0 + (sy - e.y0) * (e.x1 - e.x0) / (e.y1 - e.y0), e.dir});
+        if (xs.size() < 2) continue;
+        std::sort(xs.begin(), xs.end());
+        int w = 0;
+        for (size_t i = 0; i + 1 < xs.size(); i++) {
+            w += xs[i].second;
+            if (w == 0) continue;
+            int a = std::max(0, (int)std::ceil(xs[i].first - 0.5f));
+            int b = std::min(r.W - 1, (int)std::ceil(xs[i + 1].first - 0.5f) - 1);
+            uint32_t *row = &r.px[(size_t)y * r.W];
+            for (int x = a; x <= b; x++) row[x] = col;
+        }
+    }
+}
+
+static void vDisc(VRaster &r, float cx, float cy, float rad, uint32_t col) {
+    int x0 = std::max(0, (int)(cx - rad - 1)), x1 = std::min(r.W - 1, (int)(cx + rad + 1));
+    int y0 = std::max(0, (int)(cy - rad - 1)), y1 = std::min(r.H - 1, (int)(cy + rad + 1));
+    float r2 = rad * rad;
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+            if (dx * dx + dy * dy <= r2) r.px[(size_t)y * r.W + x] = col;
+        }
+}
+
+static void vStroke(VRaster &r, const std::vector<VPt> &pl, bool closed, float w, bool roundCap, uint32_t col) {
+    size_t n = pl.size();
+    if (n < 2) return;
+    float hw = w * 0.5f;
+    size_t segs = closed ? n : n - 1;
+    std::vector<std::vector<VPt>> one(1);
+    for (size_t i = 0; i < segs; i++) {
+        VPt a = pl[i], b = pl[(i + 1) % n];
+        float dx = b.x - a.x, dy = b.y - a.y, L = std::sqrt(dx * dx + dy * dy);
+        if (L < 1e-4f) continue;
+        float nx = -dy / L * hw, ny = dx / L * hw;
+        one[0] = {{a.x + nx, a.y + ny}, {b.x + nx, b.y + ny}, {b.x - nx, b.y - ny}, {a.x - nx, a.y - ny}};
+        vFillPolys(r, one, col);
+    }
+    // соединения (скруглённые) и концы
+    for (size_t i = 0; i < n; i++) {
+        bool end = !closed && (i == 0 || i == n - 1);
+        if (end && !roundCap) continue;
+        vDisc(r, pl[i].x, pl[i].y, hw, col);
+    }
+}
+
+static uint32_t vCol(char c) {
+    switch (c) {
+        case 'W': return 0xFFFFFFFFu;
+        case 'L': return 0xFFECECECu;
+        default: return 0xFF000000u;
+    }
+}
+
+// Рисует фигуру в RGBA-байты (size x size), со сглаживанием
+static void vRenderPiece(int color, int type, int size, std::vector<uint8_t> &rgba) {
+    const int SS = 3;
+    VRaster r;
+    r.W = r.H = size * SS;
+    r.px.assign((size_t)r.W * r.H, 0);
+    const VPiece &vp = gVP[color][type];
+    float sc = (float)r.W / 45.0f;
+    for (auto &sh : vp.shapes) {
+        std::vector<VSub> subs;
+        parsePath(sh.d, subs);
+        std::vector<std::vector<VPt>> polys;
+        for (auto &s : subs) {
+            std::vector<VPt> q;
+            for (auto v : s.p) {
+                float x = v.x, y = v.y;
+                if (sh.useM) {
+                    float nx = sh.m[0] * x + sh.m[2] * y + sh.m[4];
+                    float ny = sh.m[1] * x + sh.m[3] * y + sh.m[5];
+                    x = nx;
+                    y = ny;
+                }
+                q.push_back({x * sc, (y + vp.dy) * sc});
+            }
+            polys.push_back(q);
+        }
+        if (sh.fill) vFillPolys(r, polys, vCol(sh.fill));
+        if (sh.stroke)
+            for (size_t i = 0; i < polys.size(); i++) vStroke(r, polys[i], subs[i].closed, sh.sw * sc, sh.roundCap, vCol(sh.stroke));
+    }
+    rgba.assign((size_t)size * size * 4, 0);
+    for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++) {
+            int cnt = 0, sr = 0, sg = 0, sb = 0;
+            for (int j = 0; j < SS; j++)
+                for (int i = 0; i < SS; i++) {
+                    uint32_t v = r.px[(size_t)(y * SS + j) * r.W + x * SS + i];
+                    if (v) {
+                        cnt++;
+                        sr += (v >> 16) & 255;
+                        sg += (v >> 8) & 255;
+                        sb += v & 255;
+                    }
+                }
+            uint8_t *o = &rgba[((size_t)y * size + x) * 4];
+            if (cnt) {
+                o[0] = (uint8_t)(sr / cnt);
+                o[1] = (uint8_t)(sg / cnt);
+                o[2] = (uint8_t)(sb / cnt);
+                o[3] = (uint8_t)(cnt * 255 / (SS * SS));
+            }
+        }
+}
+
 static SDL_Texture *gPieceTex[2][7];
 static int gPieceTexSize = 0;
 static bool gTexDirty = true;
@@ -1820,33 +2291,23 @@ static void freePieceTex() {
 static void buildPieceTex(int cell) {
     freePieceTex();
     gTexDirty = false;
-    if (!gUseTex || !SDL_RenderTargetSupported(R)) {
-        gUseTex = false;
-        return;
-    }
-    int ts = std::max(32, std::min(512, cell * 2));
+    if (!gUseTex) return;
+    int ts = std::max(48, std::min(360, cell * 2));
+    std::vector<uint8_t> rgba;
     for (int c = 0; c < 2; c++)
         for (int t = 1; t <= 6; t++) {
-            SDL_Texture *tx = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, ts, ts);
-            if (!tx) { gUseTex = false; freePieceTex(); SDL_SetRenderTarget(R, nullptr); return; }
-            SDL_SetTextureBlendMode(tx, SDL_BLENDMODE_BLEND);
-            SDL_SetTextureScaleMode(tx, SDL_ScaleModeLinear);
-            if (SDL_SetRenderTarget(R, tx) != 0) {
-                SDL_DestroyTexture(tx);
+            vRenderPiece(c, t, ts, rgba);
+            SDL_Texture *tx = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, ts, ts);
+            if (!tx) {
                 gUseTex = false;
                 freePieceTex();
-                SDL_SetRenderTarget(R, nullptr);
                 return;
             }
-            SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_NONE);
-            SDL_SetRenderDrawColor(R, 0, 0, 0, 0);
-            SDL_RenderClear(R);
-            SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_BLEND);
-            drawPieceShape(c, t, 0, 0, (float)ts, true);
+            SDL_UpdateTexture(tx, nullptr, rgba.data(), ts * 4);
+            SDL_SetTextureBlendMode(tx, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(tx, SDL_ScaleModeLinear);
             gPieceTex[c][t] = tx;
         }
-    SDL_SetRenderTarget(R, nullptr);
-    SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_BLEND);
     gPieceTexSize = cell;
 }
 
@@ -1965,8 +2426,8 @@ static void playSound(int k) {
 // =====================================================================
 //                        СОСТОЯНИЕ ИГРЫ
 // =====================================================================
-enum { SC_MENU, SC_SETUP, SC_GAME, SC_STATS, SC_LEARN, SC_LESSON, SC_NET };
-enum { OV_NONE, OV_PROMO, OV_CONFIRM, OV_RESULT };
+enum { SC_MENU, SC_SETUP, SC_GAME, SC_STATS, SC_LEARN, SC_LESSON, SC_NET, SC_REVIEW, SC_EDITOR };
+enum { OV_NONE, OV_PROMO, OV_CONFIRM, OV_RESULT, OV_CHOOSE };
 enum { CF_NONE, CF_RESIGN, CF_NEW, CF_RESET, CF_NET_DRAW, CF_NET_NEW, CF_NET_LEAVE, CF_NET_LOST };
 enum { MODE_BOT = 0, MODE_TWO = 1, MODE_NET = 2 };
 
@@ -2022,6 +2483,8 @@ static const Uint32 ANIM_MS = 170;
 static bool gResultPending = false;
 static Uint32 gResultAt = 0;
 static int gListScroll = 0;
+static int gViewPly = -1;       // просмотр истории: позиция после N ходов (-1 — текущая)
+static bool gListFollow = false; // прокрутить список к выбранному ходу
 static int gSolved[16] = {0};  // решённые задачи по темам (биты = страницы)
 
 struct Pointer {
@@ -2393,6 +2856,7 @@ static void saveAll() {
              mm.level, mm.clockInit, mm.tLeft[0], mm.tLeft[1], mm.flip ? 1 : 0, mm.recorded ? 1 : 0, mm.g.result,
              mm.g.reason, mm.g.loser);
     s += buf;
+    if (!mm.g.startFen.empty()) s += "FEN " + mm.g.startFen + "\n";
     s += "MOVES";
     for (auto m : mm.g.moves) s += " " + eng::toUCI(m);
     s += "\nEND\n";
@@ -2426,7 +2890,7 @@ static void loadAll() {
     if (data.compare(0, 10, "SHAHMATY 1") != 0) return;
     if (data.find("\nEND") == std::string::npos) return;  // файл недописан
     size_t pos = 0;
-    std::string movesLine;
+    std::string movesLine, startFen;
     int mActive = 0, mMode = 0, mHuman = 0, mLevel = 2, mClock = 0, mFlip = 0, mRec = 0, mRes = 0, mReason = 0,
         mLoser = -1;
     long long t0 = 0, t1 = 0;
@@ -2466,6 +2930,8 @@ static void loadAll() {
             }
         } else if (line.compare(0, 5, "MOVES") == 0) {
             movesLine = line.substr(5);
+        } else if (line.compare(0, 4, "FEN ") == 0) {
+            startFen = line.substr(4);
         }
     }
     if (!haveMatch) return;
@@ -2478,7 +2944,7 @@ static void loadAll() {
     gM.tLeft[1] = std::max(0LL, t1);
     gM.flip = mFlip != 0;
     gM.recorded = mRec != 0;
-    gM.g.reset();
+    gM.g.reset(startFen);
     size_t i = 0;
     while (i < movesLine.size()) {
         while (i < movesLine.size() && movesLine[i] == ' ') i++;
@@ -2557,7 +3023,7 @@ static void startBot() {
         if (cap < (long long)lim) lim = (Uint32)std::max(60LL, cap);
     }
     gJob->timeMs = lim;
-    gJob->gamePly = (int)gM.g.moves.size();
+    gJob->gamePly = (int)gM.g.moves.size() + (gM.g.startFen.empty() ? 0 : 40);  // своя позиция — без «дебютной» случайности
     gJob->seed = (uint32_t)SDL_GetPerformanceCounter() ^ 0x9E3779B9u;
     gBotStart = SDL_GetTicks();
     gThread = SDL_CreateThreadWithStackSize(botThreadFn, "shahbot", 4 * 1024 * 1024, gJob);
@@ -2577,6 +3043,54 @@ static void clearSel() {
     gTargets.clear();
     gDrag.active = false;
     gDrag.started = false;
+}
+
+// ----- просмотр истории ходов -----
+static bool viewing() { return gViewPly >= 0 && gViewPly < (int)gM.g.moves.size(); }
+static const eng::Board &viewBoard() { return viewing() ? gM.g.before[(size_t)gViewPly] : gM.g.cur; }
+static int viewPly() { return viewing() ? gViewPly : (int)gM.g.moves.size(); }
+// ----- свои стрелки и кружки на доске (для обдумывания ходов) -----
+struct UArrow {
+    int a, b;
+};
+static std::vector<UArrow> gUArrows;
+static std::vector<int> gUCircles;
+static bool gArrowMode = false;   // режим «карандаш»: любое движение рисует стрелку
+static bool gArrowDrag = false;   // сейчас тянем стрелку
+static int gArrowFrom = -1;
+static void clearUserMarks() {
+    gUArrows.clear();
+    gUCircles.clear();
+    gArrowDrag = false;
+}
+static void toggleArrow(int a, int b) {
+    for (size_t i = 0; i < gUArrows.size(); i++)
+        if (gUArrows[i].a == a && gUArrows[i].b == b) {
+            gUArrows.erase(gUArrows.begin() + (long)i);
+            return;
+        }
+    UArrow u;
+    u.a = a;
+    u.b = b;
+    gUArrows.push_back(u);
+}
+static void toggleCircle(int sq) {
+    for (size_t i = 0; i < gUCircles.size(); i++)
+        if (gUCircles[i] == sq) {
+            gUCircles.erase(gUCircles.begin() + (long)i);
+            return;
+        }
+    gUCircles.push_back(sq);
+}
+
+static void navTo(int ply) {
+    clearUserMarks();
+    int n = (int)gM.g.moves.size();
+    if (ply < 0) ply = 0;
+    gViewPly = ply >= n ? -1 : ply;
+    clearSel();
+    gAnims.clear();
+    gListFollow = true;
 }
 
 static void computeTargets() {
@@ -2650,6 +3164,8 @@ static void playMove(eng::Move m, bool animate) {
     }
     clearSel();
     gListScroll = 0;
+    gViewPly = -1;
+    clearUserMarks();
     if (gM.g.cur.inCheck(gM.g.cur.side)) playSound(SND_CHECK);
     else playSound(cap ? SND_CAPTURE : SND_MOVE);
     if (gM.g.result != RES_NONE) {
@@ -2675,8 +3191,10 @@ static void tryMove(int from, int to, bool animate) {
     playMove(c[0], animate);
 }
 
-static void newMatch(int mode, int level, int colorChoice, int clockChoice) {
+static void cancelReview();
+static void newMatch(int mode, int level, int colorChoice, int clockChoice, const std::string &fen = std::string()) {
     cancelBot();
+    cancelReview();
     gM.active = true;
     gM.mode = mode;
     gM.level = level;
@@ -2687,13 +3205,15 @@ static void newMatch(int mode, int level, int colorChoice, int clockChoice) {
     gM.tLeft[0] = gM.tLeft[1] = gM.clockInit;
     gM.flip = false;
     gM.recorded = false;
-    gM.g.reset();
-    gViewSide = eng::WHITE;
+    gM.g.reset(fen);
+    gViewSide = gM.g.cur.side;
     clearSel();
     gAnims.clear();
     gResultPending = false;
     gOverlay = OV_NONE;
     gListScroll = 0;
+    gViewPly = -1;
+    clearUserMarks();
     eng::ttClear();
     gScreen = SC_GAME;
     gLastTick = SDL_GetTicks();
@@ -2708,7 +3228,7 @@ static void restartSame() {
     else if (gM.clockInit == 15 * 60000) clockChoice = 3;
     int colorChoice = gM.human == eng::BLACK ? 1 : 0;
     if (gM.mode == MODE_BOT && gSet.color == 2) colorChoice = 2;
-    newMatch(gM.mode, gM.level, colorChoice, clockChoice);
+    newMatch(gM.mode, gM.level, colorChoice, clockChoice, gM.g.startFen);
 }
 
 static void doUndo() {
@@ -2730,6 +3250,8 @@ static void doUndo() {
     clearSel();
     gViewSide = gM.g.cur.side;
     gListScroll = 0;
+    gViewPly = -1;
+    clearUserMarks();
     playSound(SND_CLICK);
     saveAll();
     startBot();
@@ -2741,8 +3263,8 @@ static bool canUndo() {
         if (gM.g.result != RES_NONE) return false;
         if (botThinking()) return true;
         if (gM.g.cur.side == gM.human) {
-            // нельзя отменить первый ход бота, если ходов больше нет
-            return !(gM.g.moves.size() == 1 && gM.human == eng::BLACK);
+            // отменяем пару ходов: бота и свой (если первым ходил бот — его ход не отменить)
+            return gM.g.moves.size() >= 2;
         }
         return true;
     }
@@ -2770,7 +3292,7 @@ static void onTimeout(int side) {
 }
 
 static bool canHumanMove() {
-    if (gScreen != SC_GAME || !gM.active || gM.g.result != RES_NONE || gOverlay != OV_NONE) return false;
+    if (gScreen != SC_GAME || !gM.active || gM.g.result != RES_NONE || gOverlay != OV_NONE || viewing()) return false;
     if (gM.mode == MODE_BOT) return !botThinking() && gM.g.cur.side == gM.human;
     if (gM.mode == MODE_NET) return netConnected() && gM.g.cur.side == gM.human;
     return true;
@@ -2780,7 +3302,7 @@ static bool canHumanMove() {
 //                     ОБУЧЕНИЕ: УРОКИ И ЗАДАЧИ
 // =====================================================================
 // Режимы страницы: показ позиции, «попробуй походить» фигурой, задача.
-enum { LM_SHOW = 0, LM_MOVES = 1, LM_PUZZLE = 2 };
+enum { LM_SHOW = 0, LM_MOVES = 1, LM_PUZZLE = 2, LM_GAME = 3 };
 struct LPage {
     const char *title;
     const char *fen;
@@ -2964,6 +3486,83 @@ static const LPage LP_NOTATION[] = {
      "x - ВЗЯТИЕ, + - ШАХ, # - МАТ.\n0-0 - КОРОТКАЯ РОКИРОВКА, 0-0-0 - ДЛИННАЯ."},
 };
 
+// Тактика на примерах: партия с приёмом (LM_GAME) + задача, где приём применяет игрок.
+// Для LM_GAME: marks — комментарии «номер_полухода|текст|...», sol — ходы партии.
+// Для задач sol — ходы через пробел: ваш, ответ соперника, ваш... («#» — любой мат).
+static const LPage LP_TACT2[] = {
+    {"ВИЛКА: ПРИМЕР", FEN_START,
+     "5|СЛОН НАЦЕЛИЛСЯ НА СЛАБОЕ ПОЛЕ f7, ЕГО ЗАЩИЩАЕТ ТОЛЬКО КОРОЛЬ.|7|КОНЬ ТОЖЕ НАПАДАЕТ НА f7. УГРОЗА ДВОЙНАЯ!|"
+     "10|ОШИБКА ЧЁРНЫХ: ПРАВИЛЬНО БЫЛО Кa5, УБИРАЯ КОНЯ С ДОРОГИ И НАПАДАЯ НА СЛОНА.|"
+     "11|ВИЛКА! КОНЬ НА f7 НАПАДАЕТ СРАЗУ НА ФЕРЗЯ d8 И ЛАДЬЮ h8. ЧЁРНЫЕ ПОТЕРЯЮТ МАТЕРИАЛ. ЭТО ДЕБЮТ ЖАРЕНАЯ ПЕЧЁНКА.",
+     LM_GAME, "e2e4 e7e5 g1f3 b8c6 f1c4 g8f6 f3g5 d7d5 e4d5 f6d5 g5f7",
+     "ВИЛКА - ОДНА ФИГУРА НАПАДАЕТ НА ДВЕ ЦЕЛИ СРАЗУ. ПОСМОТРИТЕ, КАК ЭТО БЫВАЕТ В НАСТОЯЩЕЙ ПАРТИИ. "
+     "ЛИСТАЙТЕ ХОДЫ СТРЕЛКАМИ ИЛИ НАЖМИТЕ СМОТРЕТЬ."},
+    {"ВИЛКА: ВАШ ХОД", "6k1/3q4/8/8/4N3/8/8/4K3 w - - 0 1", "", LM_PUZZLE, "e4f6 g8g7 f6d7",
+     "ТЕПЕРЬ САМИ. НАЙДИТЕ ХОД КОНЁМ С ШАХОМ, КОТОРЫЙ НАПАДАЕТ ЕЩЁ И НА ФЕРЗЯ. ПОСЛЕ ОТВЕТА СОПЕРНИКА "
+     "ЗАБЕРИТЕ ФЕРЗЯ."},
+    {"ДВОЙНОЙ УДАР: ПРИМЕР", FEN_START,
+     "9|КАЖЕТСЯ, БЕЛЫЕ ПРОСТО ОТДАЛИ КОНЯ ЗА ПЕШКУ...|10|ЧЁРНЫЕ ВЗЯЛИ КОНЯ.|"
+     "11|ДВОЙНОЙ УДАР ПЕШКОЙ! d4 НАПАДАЕТ НА СЛОНА c5 И КОНЯ e5. ОДНА ИЗ ФИГУР ПОГИБНЕТ, И БЕЛЫЕ ОТЫГРЫВАЮТ "
+     "МАТЕРИАЛ С ХОРОШИМ ЦЕНТРОМ. ЭТОТ ПРИЁМ НАЗЫВАЮТ ТРЮК С ВИЛКОЙ.",
+     LM_GAME, "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 b1c3 g8f6 f3e5 c6e5 d2d4",
+     "ДВОЙНОЙ УДАР - НАПАДЕНИЕ НА ДВЕ ФИГУРЫ ОДНИМ ХОДОМ. ЕГО МОЖЕТ НАНЕСТИ ЛЮБАЯ ФИГУРА, ДАЖЕ ПЕШКА."},
+    {"ДВОЙНОЙ УДАР: ВАШ ХОД", "r5k1/6pp/8/8/8/8/5PPP/3Q2K1 w - - 0 1", "", LM_PUZZLE, "d1d5 g8h8 d5a8",
+     "ЛАДЬЯ ЧЁРНЫХ НА a8 НЕ ЗАЩИЩЕНА. НАЙДИТЕ ХОД ФЕРЗЁМ, КОТОРЫЙ ДАЁТ ШАХ И ОДНОВРЕМЕННО НАПАДАЕТ НА ЛАДЬЮ."},
+    {"СВЯЗКА: ПРИМЕР", FEN_START,
+     "10|ЧЁРНЫЕ ВЗЯЛИ ПЕШКУ КОНЁМ...|11|...НО ЛАДЬЯ ВСТАЛА НА ЛИНИЮ e. КОНЬ e4 СВЯЗАН: ЗА НИМ СТОИТ КОРОЛЬ.|"
+     "15|Кc3 НАПАДАЕТ НА ФЕРЗЯ И НА СВЯЗАННОГО КОНЯ. ФЕРЗЬ УЙДЁТ, А КОНЬ ОСТАНЕТСЯ ПОД УДАРОМ - БЕЛЫЕ "
+     "ОТЫГРЫВАЮТ ФИГУРУ.",
+     LM_GAME, "e2e4 e7e5 g1f3 b8c6 f1c4 g8f6 d2d4 e5d4 e1g1 f6e4 f1e1 d7d5 c4d5 d8d5 b1c3",
+     "СВЯЗКА - ФИГУРА НЕ МОЖЕТ ОТОЙТИ, ПОТОМУ ЧТО ЗА НЕЙ СТОИТ КОРОЛЬ ИЛИ ЦЕННАЯ ФИГУРА. НА СВЯЗАННУЮ "
+     "ФИГУРУ ВЫГОДНО НАПАДАТЬ ЕЩЁ РАЗ."},
+    {"СВЯЗКА: ВАШ ХОД", "4k3/8/4n3/8/3P4/8/8/4R1K1 w - - 0 1", "", LM_PUZZLE, "d4d5 e8f7 d5e6",
+     "КОНЬ e6 СВЯЗАН ЛАДЬЁЙ. НАПАДИТЕ НА НЕГО ПЕШКОЙ, А ПОСЛЕ ОТВЕТА СОПЕРНИКА ЗАБЕРИТЕ КОНЯ."},
+    {"СКВОЗНОЙ УДАР: ПРИМЕР", "7q/8/3k4/8/8/8/8/2B3K1 b - - 0 1",
+     "1|ЧЁРНЫЕ НЕОСТОРОЖНО ПОСТАВИЛИ КОРОЛЯ НА ОДНУ ДИАГОНАЛЬ СО СВОИМ ФЕРЗЁМ.|"
+     "2|СКВОЗНОЙ УДАР! СЛОН ДАЁТ ШАХ, А ЗА КОРОЛЁМ НА ТОЙ ЖЕ ЛИНИИ СТОИТ ФЕРЗЬ.|3|КОРОЛЬ ОБЯЗАН УЙТИ ОТ ШАХА...|"
+     "4|...И СЛОН ЗАБИРАЕТ ФЕРЗЯ.",
+     LM_GAME, "d6e5 c1b2 e5e6 b2h8",
+     "СКВОЗНОЙ УДАР ПОХОЖ НА СВЯЗКУ НАОБОРОТ: НАПАДАЮТ НА ЦЕННУЮ ФИГУРУ, ОНА УХОДИТ, И ОТКРЫВАЕТСЯ ДРУГАЯ."},
+    {"СКВОЗНОЙ УДАР: ВАШ ХОД", "8/8/2k4q/8/8/8/8/R5K1 w - - 0 1", "", LM_PUZZLE, "a1a6 c6c7 a6h6",
+     "КОРОЛЬ И ФЕРЗЬ ЧЁРНЫХ СТОЯТ НА ОДНОЙ ГОРИЗОНТАЛИ. ДАЙТЕ ШАХ ЛАДЬЁЙ, А ЗАТЕМ ЗАБЕРИТЕ ФЕРЗЯ."},
+    {"ВСКРЫТЫЙ ШАХ: ПРИМЕР", FEN_START,
+     "6|ЧЁРНЫЕ ВЗЯЛИ ПЕШКУ, ПОВТОРЯЯ ХОДЫ БЕЛЫХ.|7|ФЕРЗЬ И ЧЁРНЫЙ КОРОЛЬ ОКАЗАЛИСЬ НА ОДНОЙ ЛИНИИ e.|"
+     "8|ОШИБКА! НУЖНО БЫЛО ИГРАТЬ Фe7.|"
+     "9|ВСКРЫТЫЙ ШАХ: КОНЬ УШЁЛ С ЛИНИИ e, И ФЕРЗЬ e2 ДАЛ ШАХ. А САМ КОНЬ НАПАЛ НА ФЕРЗЯ d8!|"
+     "12|БЕЛЫЕ ВЫИГРАЛИ ФЕРЗЯ ЗА КОНЯ. ЭТА ЛОВУШКА ИЗВЕСТНА В РУССКОЙ ПАРТИИ.",
+     LM_GAME, "e2e4 e7e5 g1f3 g8f6 f3e5 f6e4 d1e2 e4f6 e5c6 d8e7 c6e7 f8e7",
+     "ВСКРЫТЫЙ ШАХ: ФИГУРА УХОДИТ С ЛИНИИ И ОТКРЫВАЕТ ШАХ ОТ ДРУГОЙ ФИГУРЫ. ТА, ЧТО УШЛА, СВОБОДНО "
+     "НАПАДАЕТ НА ЧТО УГОДНО - СОПЕРНИК ЗАНЯТ ШАХОМ."},
+    {"ВСКРЫТЫЙ ШАХ: ВАШ ХОД", "4k3/8/8/8/q7/8/4B3/4R1K1 w - - 0 1", "", LM_PUZZLE, "e2b5 e8f7 b5a4",
+     "СЛОН ЗАКРЫВАЕТ ЛИНИЮ e. УВЕДИТЕ ЕГО С ШАХОМ ТАК, ЧТОБЫ ОН НАПАЛ НА ФЕРЗЯ, А ПОТОМ ЗАБЕРИТЕ ФЕРЗЯ."},
+    {"ПОСЛЕДНЯЯ ГОРИЗОНТАЛЬ: ПРИМЕР", "2r3k1/3q1ppp/8/8/8/8/2Q2PPP/2R3K1 w - - 0 1",
+     "1|ЖЕРТВА ФЕРЗЯ! ЧЁРНЫЙ ФЕРЗЬ ДОЛЖЕН ВЗЯТЬ.|2|ЕДИНСТВЕННЫЙ ЗАЩИТНИК ОТВЛЕЧЁН.|"
+     "3|МАТ: КОРОЛЮ МЕШАЮТ ЕГО ЖЕ ПЕШКИ.",
+     LM_GAME, "c2c8 d7c8 c1c8",
+     "КОГДА КОРОЛЬ ЗАПЕРТ СВОИМИ ПЕШКАМИ, ЗАЩИТНИК ПОСЛЕДНЕЙ ГОРИЗОНТАЛИ ПЕРЕГРУЖЕН. ЕГО МОЖНО ОТВЛЕЧЬ "
+     "ЖЕРТВОЙ."},
+    {"ПОСЛЕДНЯЯ ГОРИЗОНТАЛЬ: ВАШ ХОД", "3r2k1/4qppp/8/8/8/8/3Q1PPP/3R2K1 w - - 0 1", "", LM_PUZZLE, "d2d8 e7d8 #",
+     "ЛАДЬЮ d8 ЗАЩИЩАЕТ ФЕРЗЬ e7. ОТВЛЕКИТЕ ЕГО ЖЕРТВОЙ И ПОСТАВЬТЕ МАТ."},
+    {"СПЁРТЫЙ МАТ: ПРИМЕР", FEN_START,
+     "6|РИСКОВАННЫЙ ХОД: ЧЁРНЫЕ ОТДАЮТ ПЕШКУ e5.|8|ФЕРЗЬ НАПАДАЕТ НА КОНЯ И ПЕШКУ g2.|"
+     "9|ЖАДНОСТЬ: КОНЬ БЕРЁТ ПЕШКУ И ВИЛКОЙ НАПАДАЕТ НА ЛАДЬЮ И ФЕРЗЯ.|"
+     "13|БЕЛЫЕ ЗАКРЫЛИСЬ СЛОНОМ, НО ТЕПЕРЬ КОРОЛЬ ОКРУЖЁН СВОИМИ ФИГУРАМИ.|"
+     "14|СПЁРТЫЙ МАТ! КОРОЛЮ НЕКУДА ДЕТЬСЯ ИЗ-ЗА СОБСТВЕННЫХ ФИГУР. ЭТО ЛОВУШКА БЛЭКБЕРНА.",
+     LM_GAME, "e2e4 e7e5 g1f3 b8c6 f1c4 c6d4 f3e5 d8g5 e5f7 g5g2 h1f1 g2e4 c4e2 d4f3",
+     "СПЁРТЫЙ МАТ СТАВИТ ОБЫЧНО КОНЬ: КОРОЛЬ ОКРУЖЁН СВОИМИ ЖЕ ФИГУРАМИ И НЕ МОЖЕТ УЙТИ."},
+    {"СПЁРТЫЙ МАТ: ВАШ ХОД", "5r1k/6pp/7N/3Q4/8/8/8/6K1 w - - 0 1", "", LM_PUZZLE, "d5g8 f8g8 #",
+     "ЗНАМЕНИТАЯ КОМБИНАЦИЯ: ЖЕРТВУЙТЕ ФЕРЗЯ ТАК, ЧТОБЫ ЛАДЬЯ ЗАКРЫЛА КОРОЛЮ ПОСЛЕДНЕЕ ПОЛЕ, А ЗАТЕМ МАТ КОНЁМ."},
+    {"МАТ ЛЕГАЛЯ: ПРИМЕР", FEN_START,
+     "6|СЛОН СВЯЗАЛ КОНЯ f3 С ФЕРЗЁМ. КАЖЕТСЯ, КОНЮ НЕЛЬЗЯ УХОДИТЬ.|9|А БЕЛЫЕ ВСЁ РАВНО УХОДЯТ КОНЁМ!|"
+     "10|ЧЁРНЫЕ ЖАДНО ЗАБРАЛИ ФЕРЗЯ...|11|ШАХ СЛОНОМ, КОРОЛЮ ОСТАЁТСЯ ОДНО ПОЛЕ.|"
+     "13|МАТ ТРЕМЯ ЛЁГКИМИ ФИГУРАМИ! СВЯЗКА С ФЕРЗЁМ ОКАЗАЛАСЬ ЛОЖНОЙ.",
+     LM_GAME, "e2e4 e7e5 g1f3 d7d6 f1c4 c8g4 b1c3 g7g6 f3e5 g4d1 c4f7 e8e7 c3d5",
+     "СВЯЗКА С ФЕРЗЁМ НЕ АБСОЛЮТНА: ФИГУРА МОЖЕТ УЙТИ, ЕСЛИ ВЗЯТИЕ ФЕРЗЯ ОБОЙДЁТСЯ СОПЕРНИКУ ДОРОЖЕ. "
+     "ЭТОЙ ЛОВУШКЕ БОЛЬШЕ 250 ЛЕТ."},
+    {"МАТ ЛЕГАЛЯ: ВАШ ХОД", "rn1qkbnr/ppp2p1p/3p2p1/4N3/2B1P3/2N5/PPPP1PPP/R1BbK2R w KQkq - 0 1", "", LM_PUZZLE,
+     "c4f7 e8e7 #", "ЧЁРНЫЕ ТОЛЬКО ЧТО ЗАБРАЛИ ВАШЕГО ФЕРЗЯ. НАКАЖИТЕ ИХ: ШАХ СЛОНОМ, А ЗАТЕМ МАТ КОНЁМ."},
+};
+
 #define LCH(t, s, a) {t, s, a, (int)(sizeof(a) / sizeof(a[0]))}
 static const LChapter CHAPTERS[] = {
     LCH("ОСНОВЫ", "ДОСКА, РАССТАНОВКА, ЦЕЛЬ", LP_BASICS),
@@ -2976,6 +3575,7 @@ static const LChapter CHAPTERS[] = {
     LCH("ЭНДШПИЛЬ", "КАК ДОВЕСТИ ДЕЛО ДО МАТА", LP_ENDGAME),
     LCH("СТРАТЕГИЯ", "ПЛАН И ПОЛЕЗНЫЕ СОВЕТЫ", LP_STRATEGY),
     LCH("ЗАПИСЬ ХОДОВ", "КАК ЧИТАТЬ СПИСОК ХОДОВ", LP_NOTATION),
+    LCH("ТАКТИКА НА ПРИМЕРАХ", "ПАРТИИ И ЗАДАЧИ НА ПРИЁМЫ", LP_TACT2),
 };
 static const int NCHAP = (int)(sizeof(CHAPTERS) / sizeof(CHAPTERS[0]));
 
@@ -2996,6 +3596,18 @@ static eng::Move gLHint = 0;
 static bool gLShowHint = false;
 static int gLLastFrom = -1, gLLastTo = -1;
 static std::vector<LMark> gLMarks;
+// пример партии
+static std::vector<eng::Board> gLGPos;
+static std::vector<eng::Move> gLGMoves;
+static std::vector<std::string> gLGSan;
+static std::vector<std::pair<int, std::string>> gLGNotes;
+static int gLGPly = 0;
+static bool gLGAuto = false;
+static Uint32 gLGNext = 0;
+// задача в несколько ходов
+static std::vector<std::string> gLTok;
+static int gLStep = 0;
+static Uint32 gLReplyAt = 0;
 
 static int parseSq(const char *s) {
     if (s[0] < 'a' || s[0] > 'h' || s[1] < '1' || s[1] > '8') return -1;
@@ -3027,6 +3639,49 @@ static bool puzzleOk(eng::Board &b, eng::Move m, const char *sol) {
     if (strcmp(sol, "#") == 0) return isMateMove(b, m);
     return eng::toUCI(m).compare(0, 4, std::string(sol).substr(0, 4)) == 0;
 }
+static std::vector<std::string> splitWords(const char *s) {
+    std::vector<std::string> v;
+    std::string cur;
+    for (const char *p = s;; p++) {
+        if (*p == ' ' || !*p) {
+            if (!cur.empty()) v.push_back(cur);
+            cur.clear();
+            if (!*p) break;
+        } else {
+            cur += *p;
+        }
+    }
+    return v;
+}
+static eng::Move findUci(eng::Board &b, const std::string &u) {
+    eng::MoveList ml;
+    b.genLegal(ml);
+    for (int i = 0; i < ml.n; i++)
+        if (eng::toUCI(ml.m[i]) == u) return ml.m[i];
+    return 0;
+}
+static void computeHint() {
+    gLHint = 0;
+    if (gLStep >= (int)gLTok.size()) return;
+    eng::MoveList ml;
+    gLB.genLegal(ml);
+    for (int i = 0; i < ml.n; i++)
+        if (puzzleOk(gLB, ml.m[i], gLTok[(size_t)gLStep].c_str())) {
+            gLHint = ml.m[i];
+            return;
+        }
+}
+static void lessonGameShow(int ply) {
+    int n = (int)gLGMoves.size();
+    gLGPly = std::max(0, std::min(n, ply));
+    gLB = gLGPos[(size_t)gLGPly];
+    if (gLGPly > 0) {
+        gLLastFrom = eng::mFrom(gLGMoves[(size_t)gLGPly - 1]);
+        gLLastTo = eng::mTo(gLGMoves[(size_t)gLGPly - 1]);
+    } else {
+        gLLastFrom = gLLastTo = -1;
+    }
+}
 
 static void lessonTargets() {
     gLTargets.clear();
@@ -3051,7 +3706,9 @@ static void loadLessonPage(bool fresh) {
         gLShowHint = false;
     }
     gLMarks.clear();
-    const char *s = p.marks;
+    gLReplyAt = 0;
+    gLGAuto = false;
+    const char *s = p.mode == LM_GAME ? "" : p.marks;
     while (*s) {
         while (*s == ' ') s++;
         if (!*s) break;
@@ -3076,10 +3733,36 @@ static void loadLessonPage(bool fresh) {
     }
     gLHint = 0;
     if (p.mode == LM_PUZZLE) {
-        eng::MoveList ml;
-        gLB.genLegal(ml);
-        for (int i = 0; i < ml.n; i++)
-            if (puzzleOk(gLB, ml.m[i], p.sol)) { gLHint = ml.m[i]; break; }
+        gLTok = splitWords(p.sol);
+        gLStep = 0;
+        computeHint();
+    }
+    if (p.mode == LM_GAME) {
+        gLGPos.assign(1, gLB);
+        gLGMoves.clear();
+        gLGSan.clear();
+        for (auto &u : splitWords(p.sol)) {
+            eng::Board b = gLGPos.back();
+            eng::Move m = findUci(b, u);
+            if (!m) break;
+            gLGSan.push_back(eng::toSAN(b, m));
+            eng::Undo un;
+            b.make(m, un);
+            gLGMoves.push_back(m);
+            gLGPos.push_back(b);
+        }
+        gLGNotes.clear();
+        auto parts = std::string(p.marks);
+        size_t i = 0;
+        while (i < parts.size()) {
+            size_t a = parts.find('|', i);
+            if (a == std::string::npos) break;
+            size_t b2 = parts.find('|', a + 1);
+            if (b2 == std::string::npos) b2 = parts.size();
+            gLGNotes.push_back({atoi(parts.substr(i, a - i).c_str()), parts.substr(a + 1, b2 - a - 1)});
+            i = b2 + 1;
+        }
+        lessonGameShow(0);
     }
 }
 
@@ -3107,13 +3790,21 @@ static void lessonMove(eng::Move m) {
         playSound(cap ? SND_CAPTURE : SND_MOVE);
         return;
     }
-    bool ok = puzzleOk(gLB, m, p.sol);
+    bool ok = gLStep < (int)gLTok.size() && puzzleOk(gLB, m, gLTok[(size_t)gLStep].c_str());
     eng::Undo u;
     gLB.make(m, u);
     gLLastFrom = from;
     gLLastTo = to;
     gLSel = -1;
     gLTargets.clear();
+    if (ok && gLStep + 1 < (int)gLTok.size()) {
+        // верный ход, но комбинация не закончена — соперник отвечает
+        gLStatus = 3;
+        gLShowHint = false;
+        gLReplyAt = SDL_GetTicks() + 700;
+        playSound(cap ? SND_CAPTURE : SND_MOVE);
+        return;
+    }
     if (ok) {
         gLStatus = 1;
         gLShowHint = false;
@@ -3129,9 +3820,34 @@ static void lessonMove(eng::Move m) {
     }
 }
 
+static void lessonReply() {
+    gLReplyAt = 0;
+    if (gLStep + 1 >= (int)gLTok.size()) return;
+    eng::Move r = findUci(gLB, gLTok[(size_t)gLStep + 1]);
+    if (r) {
+        bool cap = (eng::mFlags(r) & eng::F_CAP) != 0;
+        gLLastFrom = eng::mFrom(r);
+        gLLastTo = eng::mTo(r);
+        eng::Undo u;
+        gLB.make(r, u);
+        playSound(gLB.inCheck(gLB.side) ? SND_CHECK : (cap ? SND_CAPTURE : SND_MOVE));
+    }
+    gLStep += 2;
+    gLStatus = 0;
+    computeHint();
+}
+
 static void lessonTap(int sq) {
     const LPage &p = curPage();
-    if (p.mode == LM_SHOW || gLStatus == 1 || gLResetAt) return;
+    if (p.mode == LM_GAME) {  // нажатие на доску в примере — следующий ход
+        gLGAuto = false;
+        if (gLGPly < (int)gLGMoves.size()) {
+            lessonGameShow(gLGPly + 1);
+            playSound(SND_MOVE);
+        }
+        return;
+    }
+    if (p.mode == LM_SHOW || gLStatus == 1 || gLStatus == 3 || gLResetAt || gLReplyAt) return;
     if (gLSel >= 0) {
         eng::Move pick = 0;
         for (auto m : gLTargets)
@@ -3166,6 +3882,7 @@ static std::string gNetIpInput;
 
 static void startNetMatch(int myColor, int clockMs) {
     cancelBot();
+    cancelReview();
     if (!gHaveBackup && gM.mode != MODE_NET) {
         gBackup = gM;
         gHaveBackup = true;
@@ -3186,6 +3903,8 @@ static void startNetMatch(int myColor, int clockMs) {
     gOverlay = OV_NONE;
     gConfirm = CF_NONE;
     gListScroll = 0;
+    gViewPly = -1;
+    clearUserMarks();
     gScreen = SC_GAME;
     gLastTick = SDL_GetTicks();
     playSound(SND_CLICK);
@@ -3354,6 +4073,344 @@ static std::string foundLabel(const FoundGame &f) {
 static bool netBusy() { return gNet.state != NS_IDLE || gNet.scan != SOCK_BAD; }
 
 // =====================================================================
+//                     РАЗБОР ПАРТИИ (АНАЛИЗ ОШИБОК)
+// =====================================================================
+// Движок оценивает каждую позицию партии. Потеря «шансов на победу» после
+// хода даёт оценку: неточность (?!), ошибка (?) или грубая ошибка (??).
+struct RvJob {
+    std::vector<eng::Board> pos;
+    std::vector<uint64_t> hashes;
+    Uint32 per = 100;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> done{false};
+    std::atomic<int> progress{0};
+    std::vector<int> score;
+    std::vector<eng::Move> best;
+};
+struct ReviewData {
+    bool ready = false;
+    Game g;
+    int mode = MODE_BOT;
+    int human = eng::WHITE;
+    int focus = -1;  // чьи ошибки показывать (-1 — обе стороны)
+    bool wb = true;
+    std::vector<eng::Board> pos;
+    std::vector<int> score;  // оценка позиции i с точки зрения того, кто ходит
+    std::vector<eng::Move> best;
+    std::vector<int> cls;    // 0 — нормально, 1 ?!, 2 ?, 3 ??
+    std::vector<bool> isBest;
+    std::vector<int> list;   // номера ходов с ошибками для списка
+    int cnt[2][4];
+    int acc[2];
+    int rate[2];  // общая оценка игры 1..10
+    int k = 0;               // показан ход k (1..n), 0 — начало
+    float scroll = 0, scrollStart = 0;
+};
+static ReviewData gRv;
+static RvJob *gRvJob = nullptr;
+static SDL_Thread *gRvThread = nullptr;
+static bool gRvDrag = false;
+
+static int SDLCALL rvThreadFn(void *p) {
+    RvJob *j = (RvJob *)p;
+    size_t n = j->pos.size();
+    j->score.assign(n, 0);
+    j->best.assign(n, 0);
+    for (size_t i = 0; i < n && !j->stop.load(); i++) {
+        std::vector<uint64_t> h(j->hashes.begin(), j->hashes.begin() + (long)std::min(i + 1, j->hashes.size()));
+        eng::Move bm = 0;
+        j->score[i] = eng::analyse(j->pos[i], h, j->per, 14, &j->stop, &bm);
+        j->best[i] = bm;
+        j->progress = (int)i + 1;
+    }
+    j->done = true;
+    return 0;
+}
+
+static void cancelReview() {
+    if (!gRvThread) return;
+    gRvJob->stop = true;
+    SDL_WaitThread(gRvThread, nullptr);
+    gRvThread = nullptr;
+    delete gRvJob;
+    gRvJob = nullptr;
+}
+
+static float winChance(int cp) {
+    if (cp > 1500) cp = 1500;
+    if (cp < -1500) cp = -1500;
+    return 2.0f / (1.0f + std::exp(-0.00368208f * cp)) - 1.0f;
+}
+static int rvWhiteScore(int i) {
+    return gRv.pos[(size_t)i].side == eng::WHITE ? gRv.score[(size_t)i] : -gRv.score[(size_t)i];
+}
+
+static void rvClassify() {
+    size_t n = gRv.g.moves.size();
+    gRv.cls.assign(n, 0);
+    gRv.isBest.assign(n, false);
+    gRv.list.clear();
+    memset(gRv.cnt, 0, sizeof(gRv.cnt));
+    double accSum[2] = {0, 0};
+    int accN[2] = {0, 0};
+    for (size_t i = 0; i < n; i++) {
+        int mover = gRv.pos[i].side;
+        float before = winChance(gRv.score[i]);
+        float after = winChance(-gRv.score[i + 1]);
+        float d = before - after;
+        bool best = gRv.best[i] == gRv.g.moves[i];
+        gRv.isBest[i] = best;
+        int c = 0;
+        if (!best) {
+            if (d >= 0.30f) c = 3;
+            else if (d >= 0.20f) c = 2;
+            else if (d >= 0.10f) c = 1;
+        }
+        gRv.cls[i] = c;
+        gRv.cnt[mover][c]++;
+        float wd = std::max(0.0f, d) * 50.0f;  // потеря в процентах победы
+        double a = 103.1668 * std::exp(-0.04354 * wd) - 3.1669;
+        accSum[mover] += std::max(0.0, std::min(100.0, a));
+        accN[mover]++;
+        if (c > 0 && (gRv.focus < 0 || gRv.focus == mover)) gRv.list.push_back((int)i);
+    }
+    for (int s = 0; s < 2; s++) {
+        gRv.acc[s] = accN[s] ? (int)std::lround(accSum[s] / accN[s]) : 0;
+        // оценка из 10: точность минус штрафы за ошибки
+        double r = gRv.acc[s] / 10.0 - 0.8 * gRv.cnt[s][3] - 0.35 * gRv.cnt[s][2] - 0.1 * gRv.cnt[s][1];
+        if (accN[s] == 0) r = 0;
+        gRv.rate[s] = (int)std::max(1L, std::min(10L, std::lround(r)));
+    }
+    gRv.ready = true;
+}
+
+static void startReview() {
+    if (gM.g.moves.empty()) return;
+    cancelBot();
+    cancelReview();
+    gRv = ReviewData();
+    gRv.g = gM.g;
+    gRv.mode = gM.mode;
+    gRv.human = gM.human;
+    gRv.focus = gM.mode == MODE_TWO ? -1 : gM.human;
+    gRv.wb = gM.mode == MODE_TWO ? true : gM.human == eng::WHITE;
+    size_t n = gRv.g.moves.size();
+    for (size_t i = 0; i < n; i++) gRv.pos.push_back(gRv.g.before[i]);
+    gRv.pos.push_back(gRv.g.cur);
+    eng::ttClear();
+    gRvJob = new RvJob();
+    gRvJob->pos = gRv.pos;
+    gRvJob->hashes = gRv.g.hashes;
+    gRvJob->per = (Uint32)std::max(50, std::min(250, (int)(14000 / (n + 1))));
+    gRvThread = SDL_CreateThreadWithStackSize(rvThreadFn, "shahreview", 4 * 1024 * 1024, gRvJob);
+    if (!gRvThread) {
+        rvThreadFn(gRvJob);
+        gRv.score = gRvJob->score;
+        gRv.best = gRvJob->best;
+        delete gRvJob;
+        gRvJob = nullptr;
+        rvClassify();
+    }
+    gOverlay = OV_NONE;
+    clearSel();
+    gScreen = SC_REVIEW;
+}
+
+static void pollReview() {
+    if (gRvThread && gRvJob && gRvJob->done.load()) {
+        SDL_WaitThread(gRvThread, nullptr);
+        gRvThread = nullptr;
+        gRv.score = gRvJob->score;
+        gRv.best = gRvJob->best;
+        delete gRvJob;
+        gRvJob = nullptr;
+        rvClassify();
+        gRv.k = gRv.list.empty() ? 0 : gRv.list[0] + 1;
+        playSound(SND_END);
+    }
+}
+
+static int rvNextMistake(int k) {
+    for (int i : gRv.list)
+        if (i + 1 > k) return i + 1;
+    return k;
+}
+
+static void leaveReview() {
+    cancelReview();
+    gScreen = SC_GAME;
+    gLastTick = SDL_GetTicks();
+}
+
+// =====================================================================
+//                 РАССТАНОВКА ФИГУР (РЕДАКТОР ПОЗИЦИИ)
+// =====================================================================
+static int gEdSq[64];
+static int gEdSide = eng::WHITE;
+static int gEdTool = 0;        // фигура для расстановки, 0 — ластик
+static bool gEdInit = false;
+static int gEdFrom = -1;       // клетка, с которой тянем фигуру
+static bool gEdDown = false;
+static bool gEdMoved = false;
+static std::string gCustomFen; // позиция для следующей партии (пусто — обычная)
+static const int ED_TYPES[6] = {eng::KING, eng::QUEEN, eng::ROOK, eng::BISHOP, eng::KNIGHT, eng::PAWN};
+
+static void edLoadBoard(const eng::Board &b) {
+    for (int i = 0; i < 64; i++) gEdSq[i] = b.sq[i];
+    gEdSide = b.side;
+}
+static void edEnsure() {
+    if (gEdInit) return;
+    eng::Board b;
+    b.setStart();
+    edLoadBoard(b);
+    gEdTool = eng::mkPiece(eng::WHITE, eng::QUEEN);
+    gEdInit = true;
+}
+
+// FEN из расстановки; рокировка разрешена, если король и ладья на своих местах
+static std::string edFen() {
+    std::string s;
+    for (int r = 7; r >= 0; r--) {
+        int e = 0;
+        for (int f = 0; f < 8; f++) {
+            int p = gEdSq[r * 8 + f];
+            if (!p) {
+                e++;
+                continue;
+            }
+            if (e) s += (char)('0' + e);
+            e = 0;
+            char c = " pnbrqk"[eng::pType(p)];
+            if (eng::pColor(p) == eng::WHITE) c = (char)(c - 32);
+            s += c;
+        }
+        if (e) s += (char)('0' + e);
+        if (r) s += '/';
+    }
+    s += gEdSide == eng::WHITE ? " w " : " b ";
+    std::string c;
+    int WK = eng::mkPiece(eng::WHITE, eng::KING), WR = eng::mkPiece(eng::WHITE, eng::ROOK);
+    int BK = eng::mkPiece(eng::BLACK, eng::KING), BR = eng::mkPiece(eng::BLACK, eng::ROOK);
+    if (gEdSq[4] == WK && gEdSq[7] == WR) c += 'K';
+    if (gEdSq[4] == WK && gEdSq[0] == WR) c += 'Q';
+    if (gEdSq[60] == BK && gEdSq[63] == BR) c += 'k';
+    if (gEdSq[60] == BK && gEdSq[56] == BR) c += 'q';
+    s += c.empty() ? "-" : c;
+    s += " - 0 1";
+    return s;
+}
+
+static void edCount(int color, int &total, int &pawns) {
+    total = pawns = 0;
+    for (int i = 0; i < 64; i++) {
+        int p = gEdSq[i];
+        if (p && eng::pColor(p) == color) {
+            total++;
+            if (eng::pType(p) == eng::PAWN) pawns++;
+        }
+    }
+}
+
+// Поставить фигуру; toggle — та же фигура на клетке убирается
+static bool edPlace(int sq, int piece, bool toggle) {
+    if (toggle && gEdSq[sq] == piece) {
+        gEdSq[sq] = 0;
+        return true;
+    }
+    int t = eng::pType(piece), c = eng::pColor(piece);
+    if (t == eng::PAWN && (sq < 8 || sq >= 56)) {
+        toast("ПЕШКИ НЕ СТОЯТ НА 1 И 8 ГОРИЗОНТАЛИ");
+        return false;
+    }
+    int total = 0, pawns = 0;
+    for (int i = 0; i < 64; i++) {
+        int p = gEdSq[i];
+        if (i == sq || !p || eng::pColor(p) != c) continue;
+        if (t == eng::KING && p == piece) continue;  // старый король уйдёт
+        total++;
+        if (eng::pType(p) == eng::PAWN) pawns++;
+    }
+    if (total >= 16) {
+        toast("НЕ БОЛЬШЕ 16 ФИГУР У СТОРОНЫ");
+        return false;
+    }
+    if (t == eng::PAWN && pawns >= 8) {
+        toast("НЕ БОЛЬШЕ 8 ПЕШЕК У СТОРОНЫ");
+        return false;
+    }
+    if (t == eng::KING)
+        for (int i = 0; i < 64; i++)
+            if (i != sq && gEdSq[i] == piece) gEdSq[i] = 0;
+    gEdSq[sq] = piece;
+    return true;
+}
+
+static void edTap(int sq) {
+    if (gEdTool == 0) {
+        if (gEdSq[sq]) playSound(SND_CAPTURE);
+        gEdSq[sq] = 0;
+        return;
+    }
+    if (edPlace(sq, gEdTool, true)) playSound(SND_MOVE);
+}
+
+static void edMove(int from, int to) {
+    if (from == to) return;
+    int p = gEdSq[from];
+    if (!p) return;
+    gEdSq[from] = 0;
+    if (edPlace(to, p, false)) playSound(SND_MOVE);
+    else gEdSq[from] = p;
+}
+
+// Проверка позиции перед игрой
+static bool edCheck(std::string &msg) {
+    int wk = 0, bk = 0;
+    for (int i = 0; i < 64; i++) {
+        if (gEdSq[i] == eng::mkPiece(eng::WHITE, eng::KING)) wk++;
+        if (gEdSq[i] == eng::mkPiece(eng::BLACK, eng::KING)) bk++;
+    }
+    if (!wk) { msg = "ПОСТАВЬТЕ БЕЛОГО КОРОЛЯ"; return false; }
+    if (!bk) { msg = "ПОСТАВЬТЕ ЧЁРНОГО КОРОЛЯ"; return false; }
+    eng::Board b;
+    if (!b.setFEN(edFen())) { msg = "ОШИБКА В ПОЗИЦИИ"; return false; }
+    {
+        int a = b.kingSq[0], c = b.kingSq[1];
+        if (std::abs((a & 7) - (c & 7)) <= 1 && std::abs((a >> 3) - (c >> 3)) <= 1) {
+            msg = "КОРОЛИ НЕ МОГУТ СТОЯТЬ РЯДОМ";
+            return false;
+        }
+    }
+    int other = b.side ^ 1;
+    if (b.inCheck(other)) {
+        msg = std::string("ШАХ ") + (other == eng::WHITE ? "БЕЛЫМ" : "ЧЁРНЫМ") + ", А ХОДЯТ " +
+              (b.side == eng::WHITE ? "БЕЛЫЕ" : "ЧЁРНЫЕ");
+        return false;
+    }
+    eng::MoveList ml;
+    b.genLegal(ml);
+    if (!ml.n) {
+        msg = b.inCheck(b.side) ? "В ЭТОЙ ПОЗИЦИИ УЖЕ МАТ" : "В ЭТОЙ ПОЗИЦИИ УЖЕ ПАТ";
+        return false;
+    }
+    if (b.insufficient()) { msg = "НЕ ХВАТАЕТ ФИГУР ДЛЯ МАТА"; return false; }
+    msg = "ПОЗИЦИЯ ГОТОВА К ИГРЕ";
+    return true;
+}
+
+static void edClear() {
+    int wk = -1, bk = -1;
+    for (int i = 0; i < 64; i++) {
+        if (gEdSq[i] == eng::mkPiece(eng::WHITE, eng::KING)) wk = i;
+        if (gEdSq[i] == eng::mkPiece(eng::BLACK, eng::KING)) bk = i;
+        gEdSq[i] = 0;
+    }
+    gEdSq[wk >= 0 ? wk : 4] = eng::mkPiece(eng::WHITE, eng::KING);
+    gEdSq[bk >= 0 ? bk : 60] = eng::mkPiece(eng::BLACK, eng::KING);
+}
+
+// =====================================================================
 //                         РАЗМЕТКА И КНОПКИ
 // =====================================================================
 enum {
@@ -3372,10 +4429,15 @@ enum {
     B_PLAY_NET, B_NET_HOST, B_NET_JOIN, B_NET_CANCEL, B_NET_MANUAL, B_NET_GO, B_DRAW,
     B_KEY0, B_KEY1, B_KEY2, B_KEY3, B_KEY4, B_KEY5, B_KEY6, B_KEY7, B_KEY8, B_KEY9, B_KEY_DOT, B_KEY_DEL,
     B_FOUND0, B_FOUND1, B_FOUND2, B_FOUND3, B_FOUND4, B_FOUND5,
+    B_NAV_FIRST, B_NAV_PREV, B_NAV_NEXT, B_NAV_LAST, B_ARROWS,
+    B_LG_FIRST, B_LG_PREV, B_LG_PLAY, B_LG_NEXT, B_LG_LAST,
+    B_EDITOR, B_ED_PAL0, B_ED_PAL_END = B_ED_PAL0 + 11, B_ED_ERASER, B_ED_WHITE, B_ED_BLACK, B_ED_CLEAR, B_ED_START,
+    B_ED_GAME, B_ED_PLAY, B_ED_BOT, B_ED_TWO,
+    B_REVIEW, B_RES_REVIEW, B_RV_FIRST, B_RV_PREV, B_RV_NEXT, B_RV_LAST, B_RV_MIST, B_RV_DONE,
     B_CH0  // B_CH0 + номер темы — должна быть последней
 };
 enum { ST_NORMAL, ST_PRIMARY, ST_DANGER, ST_SEG, ST_TOOL };
-enum { IC_NONE, IC_UNDO, IC_FLAG, IC_PLUS, IC_FLIP, IC_MENU, IC_EQUAL };
+enum { IC_NONE, IC_UNDO, IC_FLAG, IC_PLUS, IC_FLIP, IC_MENU, IC_EQUAL, IC_FIRST, IC_PREV, IC_NEXT, IC_LAST, IC_SEARCH, IC_PENCIL, IC_ERASER };
 
 struct Btn {
     SDL_FRect r;
@@ -3435,7 +4497,8 @@ static LessonLayout lessonLayout() {
     L.bx = std::floor((W - L.S) * 0.5f);
     L.by = std::floor(L.titleY + textH(L.tsT) + U * 4);
     L.statusY = L.by + L.S + U * 3;
-    float statusH = curPage().mode == LM_SHOW ? 0.0f : textH(L.ts) + U * 3;
+    int md = curPage().mode;
+    float statusH = md == LM_SHOW ? 0.0f : md == LM_GAME ? std::max(36.0f, U * 11.0f) + U * 3 : textH(L.ts) + U * 3;
     L.textX = L.pad;
     L.textW = W - 2 * L.pad;
     L.textY = L.statusY + statusH;
@@ -3443,8 +4506,74 @@ static LessonLayout lessonLayout() {
     return L;
 }
 
+struct EdLayout {
+    float pad, titleY, bx, by, cell, S, palY1, palY2, palW, palH, palGap, infoY, opt1Y, opt2Y, optH, btnY, btnH;
+    int ts, tsS;
+};
+static EdLayout edLayout() {
+    EdLayout L;
+    float W = (float)gW, H = (float)gH, U = uiU();
+    L.pad = std::max(6.0f, U * 3.0f);
+    L.ts = uiTS();
+    L.tsS = std::max(1, (int)std::lround(U * 0.42f));
+    L.titleY = H * 0.05f + U * 2;
+    L.btnH = std::max(40.0f, U * 13.0f);
+    L.btnY = H - U * 4 - L.btnH;
+    L.optH = std::max(34.0f, U * 10.5f);
+    L.opt2Y = L.btnY - U * 2.5f - L.optH;
+    L.opt1Y = L.opt2Y - U * 2 - L.optH;
+    float infoH = textH(L.tsS) * 2 + U * 3;
+    L.infoY = L.opt1Y - U * 2 - infoH;
+    L.palGap = U * 1.5f;
+    L.palW = (W - 2 * L.pad - 6 * L.palGap) / 7;
+    L.palH = std::min(L.palW, U * 12.0f);
+    L.palY2 = L.infoY - U * 2 - L.palH;
+    L.palY1 = L.palY2 - L.palGap - L.palH;
+    float zoneTop = L.titleY + textH(L.ts + 1) + U * 3, zoneBot = L.palY1 - U * 3;
+    float S = std::min(W - 2 * L.pad, zoneBot - zoneTop);
+    L.cell = std::max(6.0f, std::floor(S / 8.0f));
+    L.S = L.cell * 8;
+    L.bx = std::floor((W - L.S) * 0.5f);
+    L.by = std::floor(zoneTop + std::max(0.0f, (zoneBot - zoneTop - L.S) * 0.5f));
+    return L;
+}
+
+struct RvLayout {
+    float top, pad, titleY, rateY, sumY, bx, by, cell, S, evalY, evalH, infoY, listY, listH, rowH, navY, navH, btnY, btnH;
+    int ts, tsS;
+};
+static RvLayout rvLayout() {
+    RvLayout L;
+    float W = (float)gW, H = (float)gH, U = uiU();
+    L.top = H * 0.05f;
+    L.pad = std::max(6.0f, U * 3.0f);
+    L.ts = uiTS();
+    L.tsS = std::max(1, (int)std::lround(U * 0.42f));
+    L.titleY = L.top + U * 2;
+    L.rateY = L.titleY + textH(L.ts + 1) + U * 3;
+    L.sumY = L.rateY + textH(L.ts + 2) + U * 4;
+    float sumH = 2 * (textH(L.tsS) + U * 2);
+    L.btnH = std::max(40.0f, U * 13.0f);
+    L.btnY = H - U * 4 - L.btnH;
+    L.navH = std::max(34.0f, U * 10.5f);
+    L.navY = L.btnY - U * 2.5f - L.navH;
+    float S = std::min(W - 2 * L.pad, H * 0.34f);
+    L.cell = std::max(6.0f, std::floor(S / 8.0f));
+    L.S = L.cell * 8;
+    L.bx = std::floor((W - L.S) * 0.5f);
+    L.by = std::floor(L.sumY + sumH + U * 2);
+    L.evalY = L.by + L.S + U * 1.5f;
+    L.evalH = std::max(4.0f, U * 1.8f);
+    L.infoY = L.evalY + L.evalH + U * 3;
+    float infoH = textH(L.ts) + U * 2 + 2 * (textH(L.tsS) + U * 2);
+    L.listY = L.infoY + infoH + U * 1;
+    L.listH = L.navY - U * 2 - L.listY;
+    L.rowH = textH(L.tsS) + U * 3;
+    return L;
+}
+
 struct GameLayout {
-    float top, pad, barH, btnH, bx, by, cell, S, topBarY, botBarY, listX, listY, listW, listH, btnY;
+    float top, pad, barH, btnH, bx, by, cell, S, topBarY, botBarY, listX, listY, listW, listH, btnY, navY, navH;
     int ts, tsSmall;
 };
 
@@ -3476,6 +4605,8 @@ static GameLayout gameLayout() {
     L.listY = y + L.pad * 0.5f;
     L.listW = W - 2 * L.pad;
     L.listH = L.btnY - L.pad * 0.6f - L.listY;
+    L.navH = std::max(30.0f, U * 9.5f);
+    L.navY = L.listY + L.listH - L.navH - U * 1.8f;
     L.ts = uiTS();
     L.tsSmall = std::max(1, (int)std::lround(U * 0.42f));
     return L;
@@ -3554,9 +4685,13 @@ static void buildScreenButtons() {
             gScreenBtns.push_back(mkBtn(x + hw + gap, y, hw, bh, B_PLAY_NET, "ПО СЕТИ", ST_NORMAL, bts));
         }
         y += bh + gap;
-        gScreenBtns.push_back(mkBtn(x, y, bw, bh, B_LEARN, "ОБУЧЕНИЕ", ST_NORMAL, bts));
+        gScreenBtns.push_back(mkBtn(x, y, bw, bh, B_EDITOR, "РАССТАНОВКА ФИГУР", ST_NORMAL, bts));
         y += bh + gap;
-        gScreenBtns.push_back(mkBtn(x, y, bw, bh, B_STATS, "СТАТИСТИКА", ST_NORMAL, bts));
+        {
+            float hw = (bw - gap) * 0.5f;
+            gScreenBtns.push_back(mkBtn(x, y, hw, bh, B_LEARN, "ОБУЧЕНИЕ", ST_NORMAL, bts));
+            gScreenBtns.push_back(mkBtn(x + hw + gap, y, hw, bh, B_STATS, "СТАТИСТИКА", ST_NORMAL, bts));
+        }
         y += bh + gap;
         float hw = (bw - gap) * 0.5f;
         gScreenBtns.push_back(mkBtn(x, y, hw, bh, B_SOUND, gSoundOn ? "ЗВУК: ВКЛ" : "ЗВУК: ВЫКЛ", ST_NORMAL, ts));
@@ -3647,6 +4782,60 @@ static void buildScreenButtons() {
         } else {
             gScreenBtns.push_back(mkBtn(x, yb, bw, bh2, B_NET_CANCEL, "ОТМЕНА", ST_NORMAL, ts + 1));
         }
+    } else if (gScreen == SC_EDITOR) {
+        EdLayout L = edLayout();
+        for (int c = 0; c < 2; c++)
+            for (int i = 0; i < 6; i++) {
+                Btn b = mkBtn(L.pad + i * (L.palW + L.palGap), c ? L.palY2 : L.palY1, L.palW, L.palH, B_ED_PAL0 + c * 6 + i, "",
+                              ST_SEG, ts);
+                b.piece = eng::mkPiece(c, ED_TYPES[i]);
+                b.selected = gEdTool == b.piece;
+                gScreenBtns.push_back(b);
+            }
+        Btn er = mkBtn(L.pad + 6 * (L.palW + L.palGap), L.palY1, L.palW, 2 * L.palH + L.palGap, B_ED_ERASER, "", ST_TOOL, ts);
+        er.icon = IC_ERASER;
+        er.selected = gEdTool == 0;
+        gScreenBtns.push_back(er);
+        float g = U * 2.0f, fw = W - 2 * L.pad;
+        float hw = (fw - g) * 0.5f;
+        Btn sw = mkBtn(L.pad, L.opt1Y, hw, L.optH, B_ED_WHITE, "ХОДЯТ БЕЛЫЕ", ST_SEG, ts);
+        sw.selected = gEdSide == eng::WHITE;
+        Btn sb = mkBtn(L.pad + hw + g, L.opt1Y, hw, L.optH, B_ED_BLACK, "ХОДЯТ ЧЁРНЫЕ", ST_SEG, ts);
+        sb.selected = gEdSide == eng::BLACK;
+        gScreenBtns.push_back(sw);
+        gScreenBtns.push_back(sb);
+        float tw = (fw - 2 * g) / 3;
+        gScreenBtns.push_back(mkBtn(L.pad, L.opt2Y, tw, L.optH, B_ED_CLEAR, "ОЧИСТИТЬ", ST_NORMAL, ts));
+        gScreenBtns.push_back(mkBtn(L.pad + tw + g, L.opt2Y, tw, L.optH, B_ED_START, "НАЧАЛЬНАЯ", ST_NORMAL, ts));
+        Btn fg = mkBtn(L.pad + 2 * (tw + g), L.opt2Y, tw, L.optH, B_ED_GAME, "ИЗ ПАРТИИ", ST_NORMAL, ts);
+        fg.enabled = gM.active;
+        gScreenBtns.push_back(fg);
+        float bw1 = fw * 0.38f;
+        gScreenBtns.push_back(mkBtn(L.pad, L.btnY, bw1, L.btnH, B_BACK, "НАЗАД", ST_NORMAL, ts + 1));
+        gScreenBtns.push_back(mkBtn(L.pad + bw1 + g, L.btnY, fw - bw1 - g, L.btnH, B_ED_PLAY, "ИГРАТЬ", ST_PRIMARY, ts + 1));
+    } else if (gScreen == SC_REVIEW) {
+        RvLayout L = rvLayout();
+        int n = (int)gRv.g.moves.size();
+        if (gRv.ready) {
+            float g = U * 1.6f;
+            float wM = (W - 2 * L.pad) * 0.34f;
+            float wS = (W - 2 * L.pad - wM - 4 * g) / 4;
+            int ids[5] = {B_RV_FIRST, B_RV_PREV, B_RV_NEXT, B_RV_LAST, B_RV_MIST};
+            int ics[5] = {IC_FIRST, IC_PREV, IC_NEXT, IC_LAST, IC_NONE};
+            float x = L.pad;
+            for (int i = 0; i < 5; i++) {
+                float w = i == 4 ? wM : wS;
+                Btn b = mkBtn(x, L.navY, w, L.navH, ids[i], i == 4 ? "СЛЕД. ОШИБКА" : "", i == 4 ? ST_NORMAL : ST_TOOL, ts);
+                b.icon = ics[i];
+                if (i < 2) b.enabled = gRv.k > 0;
+                else if (i < 4) b.enabled = gRv.k < n;
+                else b.enabled = rvNextMistake(gRv.k) != gRv.k;
+                gScreenBtns.push_back(b);
+                x += w + g;
+            }
+        }
+        gScreenBtns.push_back(mkBtn(L.pad, L.btnY, W - 2 * L.pad, L.btnH, B_RV_DONE, gRv.ready ? "К ПАРТИИ" : "ОТМЕНА",
+                                    ST_PRIMARY, ts + 1));
     } else if (gScreen == SC_LEARN) {
         float bw = std::min(W * 0.9f, U * 90.0f), x = (W - bw) * 0.5f;
         float top = H * 0.05f;
@@ -3665,7 +4854,26 @@ static void buildScreenButtons() {
         bool last = gLPg >= CHAPTERS[gLCh].n - 1;
         Btn prev = mkBtn(L.pad, L.btnY, bw, L.btnH, B_L_PREV, "НАЗАД", ST_NORMAL, ts);
         prev.enabled = gLPg > 0;
-        std::string mid = p.mode == LM_SHOW ? "ТЕМЫ" : p.mode == LM_MOVES ? "СБРОС" : (gLStatus == 1 ? "СНОВА" : "ПОДСКАЗКА");
+        std::string mid = (p.mode == LM_SHOW || p.mode == LM_GAME) ? "ТЕМЫ" : p.mode == LM_MOVES ? "СБРОС" : (gLStatus == 1 ? "СНОВА" : "ПОДСКАЗКА");
+        if (p.mode == LM_GAME) {
+            float ch = std::max(36.0f, U * 11.0f), cg = U * 1.6f;
+            float wPlay = (W - 2 * L.pad) * 0.32f;
+            float wSmall = (W - 2 * L.pad - wPlay - 4 * cg) / 4;
+            float cx = L.pad;
+            int ids[5] = {B_LG_FIRST, B_LG_PREV, B_LG_PLAY, B_LG_NEXT, B_LG_LAST};
+            int ics[5] = {IC_FIRST, IC_PREV, IC_NONE, IC_NEXT, IC_LAST};
+            int n = (int)gLGMoves.size();
+            for (int i = 0; i < 5; i++) {
+                float w = i == 2 ? wPlay : wSmall;
+                std::string lbl = i == 2 ? (gLGAuto ? "ПАУЗА" : (gLGPly >= n ? "СНАЧАЛА" : "СМОТРЕТЬ")) : "";
+                Btn b = mkBtn(cx, L.statusY, w, ch, ids[i], lbl, i == 2 ? ST_PRIMARY : ST_TOOL, ts);
+                b.icon = ics[i];
+                if (i < 2) b.enabled = gLGPly > 0;
+                if (i > 2) b.enabled = gLGPly < n;
+                gScreenBtns.push_back(b);
+                cx += w + cg;
+            }
+        }
         Btn m = mkBtn(L.pad + bw + gap, L.btnY, bw, L.btnH, B_L_MID, mid, ST_NORMAL, ts);
         std::string nx = !last ? "ДАЛЕЕ" : (gLCh < NCHAP - 1 ? "ДАЛЕЕ" : "ГОТОВО");
         Btn n = mkBtn(L.pad + 2 * (bw + gap), L.btnY, bw, L.btnH, B_L_NEXT, nx, ST_PRIMARY, ts);
@@ -3682,9 +4890,10 @@ static void buildScreenButtons() {
         float gap = L.pad * 0.5f;
         float bw = (L.listW - 4 * gap) / 5;
         bool net = gM.mode == MODE_NET;
-        const char *lb[5] = {net ? "НИЧЬЯ" : "ОТМЕНА", "СДАТЬСЯ", "НОВАЯ", "ПОВОРОТ", "МЕНЮ"};
-        int ids[5] = {net ? B_DRAW : B_UNDO, B_RESIGN, B_NEW, B_FLIP, B_MENU};
-        int ic[5] = {net ? IC_EQUAL : IC_UNDO, IC_FLAG, IC_PLUS, IC_FLIP, IC_MENU};
+        bool over = gM.g.result != RES_NONE && !gM.g.moves.empty();
+        const char *lb[5] = {over ? "РАЗБОР" : (net ? "НИЧЬЯ" : "ОТМЕНА"), "СДАТЬСЯ", "НОВАЯ", "ПОВОРОТ", "МЕНЮ"};
+        int ids[5] = {over ? B_REVIEW : (net ? B_DRAW : B_UNDO), B_RESIGN, B_NEW, B_FLIP, B_MENU};
+        int ic[5] = {over ? IC_SEARCH : (net ? IC_EQUAL : IC_UNDO), IC_FLAG, IC_PLUS, IC_FLIP, IC_MENU};
         int lts = L.tsSmall;
         for (int i = 0; i < 5; i++) lts = std::min(lts, fitScale(lb[i], bw * 0.9f, L.tsSmall));
         for (int i = 0; i < 5; i++) {
@@ -3694,6 +4903,19 @@ static void buildScreenButtons() {
             if (ids[i] == B_RESIGN) b.enabled = gM.g.result == RES_NONE && (!net || netConnected());
             if (ids[i] == B_DRAW) b.enabled = gM.g.result == RES_NONE && netConnected() && !gM.g.moves.empty();
             if (ids[i] == B_NEW && net) b.enabled = netConnected();
+            gScreenBtns.push_back(b);
+        }
+        // кнопки просмотра ходов
+        float ng = U * 2.0f;
+        float nw = (L.listW - U * 6 - 4 * ng) / 5;
+        int nid[5] = {B_NAV_FIRST, B_NAV_PREV, B_NAV_NEXT, B_NAV_LAST, B_ARROWS};
+        int nic[5] = {IC_FIRST, IC_PREV, IC_NEXT, IC_LAST, IC_PENCIL};
+        int vp = viewPly(), n = (int)gM.g.moves.size();
+        for (int i = 0; i < 5; i++) {
+            Btn b = mkBtn(L.listX + U * 3 + i * (nw + ng), L.navY, nw, L.navH, nid[i], "", ST_TOOL, lts);
+            b.icon = nic[i];
+            if (i < 4) b.enabled = i < 2 ? vp > 0 : vp < n;
+            else b.selected = gArrowMode;
             gScreenBtns.push_back(b);
         }
     }
@@ -3724,12 +4946,24 @@ static void buildOverlayButtons() {
         int yesStyle = (gConfirm == CF_NEW || gConfirm == CF_NET_DRAW || gConfirm == CF_NET_NEW || lostMsg) ? ST_PRIMARY : ST_DANGER;
         gOverBtns.push_back(mkBtn(p.x + U * 4, y, bw, bh, B_YES, lostMsg ? "В МЕНЮ" : "ДА", yesStyle, ts + 1));
         gOverBtns.push_back(mkBtn(p.x + p.w - U * 4 - bw, y, bw, bh, B_NO, lostMsg ? "ЗАКРЫТЬ" : "НЕТ", ST_NORMAL, ts + 1));
-    } else if (gOverlay == OV_RESULT) {
-        Panel p = overlayPanel(106);
-        float bw = p.w - U * 10, bh = std::max(38.0f, U * 12.5f), gap = U * 2.5f;
+    } else if (gOverlay == OV_CHOOSE) {
+        Panel p = overlayPanel(78);
+        float bw = p.w - U * 10, bh = std::max(40.0f, U * 13.0f), gap = U * 2.5f;
         float x = p.x + U * 5;
         float y = p.y + p.h - U * 5 - 3 * bh - 2 * gap;
+        gOverBtns.push_back(mkBtn(x, y, bw, bh, B_ED_BOT, "С БОТОМ", ST_PRIMARY, ts + 1));
+        y += bh + gap;
+        gOverBtns.push_back(mkBtn(x, y, bw, bh, B_ED_TWO, "ВДВОЁМ", ST_NORMAL, ts + 1));
+        y += bh + gap;
+        gOverBtns.push_back(mkBtn(x, y, bw, bh, B_NO, "ОТМЕНА", ST_NORMAL, ts));
+    } else if (gOverlay == OV_RESULT) {
+        Panel p = overlayPanel(120);
+        float bw = p.w - U * 10, bh = std::max(38.0f, U * 12.0f), gap = U * 2.2f;
+        float x = p.x + U * 5;
+        float y = p.y + p.h - U * 5 - 4 * bh - 3 * gap;
         gOverBtns.push_back(mkBtn(x, y, bw, bh, B_RES_NEW, "НОВАЯ ПАРТИЯ", ST_PRIMARY, ts + 1));
+        y += bh + gap;
+        gOverBtns.push_back(mkBtn(x, y, bw, bh, B_RES_REVIEW, "РАЗБОР ОШИБОК", ST_NORMAL, ts));
         y += bh + gap;
         gOverBtns.push_back(mkBtn(x, y, bw, bh, B_RES_VIEW, "СМОТРЕТЬ ДОСКУ", ST_NORMAL, ts));
         y += bh + gap;
@@ -3838,6 +5072,56 @@ static void drawIcon(int ic, float cx, float cy, float s, Col c) {
         case IC_MENU:
             for (int i = -1; i <= 1; i++) thickLine(cx - s * 0.34f, cy + i * s * 0.28f, cx + s * 0.34f, cy + i * s * 0.28f, w, c);
             break;
+        case IC_FIRST: case IC_PREV: case IC_NEXT: case IC_LAST: {
+            float dir = (ic == IC_FIRST || ic == IC_PREV) ? -1.0f : 1.0f;
+            float h = s * 0.42f;
+            Poly t;
+            float tip = cx + dir * s * 0.30f, back = cx - dir * s * 0.22f;
+            if (ic == IC_FIRST || ic == IC_LAST) { tip += dir * s * -0.08f; back += dir * s * -0.08f; }
+            t.push_back(P(tip, cy));
+            t.push_back(P(back, cy - h));
+            t.push_back(P(back, cy + h));
+            fillConvex(t, solid(c));
+            if (ic == IC_FIRST || ic == IC_LAST) {
+                float bx = tip + dir * s * 0.10f;
+                thickLine(bx, cy - h, bx, cy + h, std::max(2.0f, s * 0.13f), c, false);
+            }
+            break;
+        }
+        case IC_PENCIL: {  // стрелка-указатель
+            float x0 = cx - s * 0.32f, y0 = cy + s * 0.32f, x1 = cx + s * 0.30f, y1 = cy - s * 0.30f;
+            thickLine(x0, y0, x1 - s * 0.10f, y1 + s * 0.10f, w * 1.1f, c);
+            Poly t;
+            t.push_back(P(x1 + s * 0.06f, y1 - s * 0.06f));
+            t.push_back(P(x1 - s * 0.30f, y1 - s * 0.02f));
+            t.push_back(P(x1 + s * 0.02f, y1 + s * 0.30f));
+            fillConvex(t, solid(c));
+            break;
+        }
+        case IC_ERASER: {  // ластик: наклонный брусок
+            float a = 0.785f, ca = std::cos(a), sa = std::sin(a);
+            float hw = s * 0.42f, hh = s * 0.20f;
+            auto pt = [&](float u, float v) { return P(cx + u * ca - v * sa, cy + u * sa + v * ca); };
+            Poly body;
+            body.push_back(pt(-hw, -hh));
+            body.push_back(pt(hw, -hh));
+            body.push_back(pt(hw, hh));
+            body.push_back(pt(-hw, hh));
+            fillConvex(body, solid(c));
+            Poly tip;
+            tip.push_back(pt(-hw, -hh));
+            tip.push_back(pt(-hw * 0.15f, -hh));
+            tip.push_back(pt(-hw * 0.15f, hh));
+            tip.push_back(pt(-hw, hh));
+            fillConvex(tip, solid(C(236, 120, 110)));
+            break;
+        }
+        case IC_SEARCH: {
+            float r = s * 0.26f;
+            ringShape(cx - s * 0.08f, cy - s * 0.08f, r - w * 0.5f, r + w * 0.5f, c);
+            thickLine(cx + s * 0.12f, cy + s * 0.12f, cx + s * 0.38f, cy + s * 0.38f, w * 1.3f, c);
+            break;
+        }
         case IC_EQUAL:
             thickLine(cx - s * 0.34f, cy - s * 0.17f, cx + s * 0.34f, cy - s * 0.17f, w * 1.2f, c);
             thickLine(cx - s * 0.34f, cy + s * 0.17f, cx + s * 0.34f, cy + s * 0.17f, w * 1.2f, c);
@@ -3856,7 +5140,10 @@ static void drawButton(const Btn &b, bool pressed) {
             if (b.selected) { top = C(242, 196, 104); bot = C(196, 136, 52); border = C(255, 230, 170); tc = C(48, 30, 10); }
             else { top = C(58, 70, 90); bot = C(42, 52, 68); border = C(84, 98, 122); }
             break;
-        case ST_TOOL: top = C(52, 63, 82); bot = C(38, 47, 62); border = C(76, 90, 114); break;
+        case ST_TOOL:
+            if (b.selected) { top = C(70, 170, 80); bot = C(40, 128, 52); border = C(150, 230, 150); }
+            else { top = C(52, 63, 82); bot = C(38, 47, 62); border = C(76, 90, 114); }
+            break;
         default: top = C(66, 80, 102); bot = C(46, 57, 75); border = C(96, 112, 138); break;
     }
     if (pressed) { top = mix(top, C(0, 0, 0), 0.25f); bot = mix(bot, C(0, 0, 0), 0.25f); }
@@ -3867,10 +5154,19 @@ static void drawButton(const Btn &b, bool pressed) {
     float bw = std::max(1.0f, uiU() * 0.35f);
     fillRRect(b.r.x + bw, b.r.y + bw + off, b.r.w - 2 * bw, b.r.h - 2 * bw, rad - bw, vgrad(top, bot, b.r.y, b.r.y + b.r.h));
     float cx = b.r.x + b.r.w * 0.5f;
+    if (b.style == ST_TOOL && b.label.empty()) {
+        drawIcon(b.icon, cx, b.r.y + b.r.h * 0.5f + off, b.r.h * 0.42f, tc);
+        return;
+    }
     if (b.style == ST_TOOL) {
         float is = b.r.h * 0.36f;
         drawIcon(b.icon, cx, b.r.y + b.r.h * 0.36f + off, is, tc);
         text(b.label, cx, b.r.y + b.r.h * 0.70f + off, b.ts, tc, 1, false);
+        return;
+    }
+    if (b.piece > 0 && b.label.empty()) {
+        float ps = std::min(b.r.h, b.r.w) * 0.86f;
+        drawPiece(b.piece, cx - ps * 0.5f, b.r.y + (b.r.h - ps) * 0.5f + off, ps);
         return;
     }
     if (b.piece > 0) {
@@ -3928,9 +5224,12 @@ static void drawSetup() {
     std::string title = gSetupMode == MODE_BOT ? "ИГРА С БОТОМ" : "ИГРА ВДВОЁМ";
     tts = fitScale(title, W * 0.9f, tts);
     text(title, W * 0.5f, top + U * 6, tts, COL_GOLD, 1);
-    if (gSetupMode == MODE_TWO) {
-        int s2 = fitScale("ДОСКА ПОВОРАЧИВАЕТСЯ ПОСЛЕ ХОДА", W * 0.9f, ts);
-        text("ДОСКА ПОВОРАЧИВАЕТСЯ ПОСЛЕ ХОДА", W * 0.5f, top + U * 6 + textH(tts) + U * 3, s2, COL_DIM, 1, false);
+    {
+        std::string sub = !gCustomFen.empty() ? "СВОЯ РАССТАНОВКА ФИГУР" : (gSetupMode == MODE_TWO ? "ДОСКА ПОВОРАЧИВАЕТСЯ ПОСЛЕ ХОДА" : "");
+        if (!sub.empty()) {
+            int s2 = fitScale(sub, W * 0.9f, ts);
+            text(sub, W * 0.5f, top + U * 6 + textH(tts) + U * 3, s2, gCustomFen.empty() ? COL_DIM : C(140, 196, 255), 1, false);
+        }
     }
     float bw = std::min(W * 0.9f, U * 90.0f), x = (W - bw) * 0.5f;
     float bh = std::max(36.0f, U * 12.5f);
@@ -4009,14 +5308,23 @@ static void capturedInfo(int color, std::vector<int> &capt, int &adv) {
     // capt — фигуры противника, которые съел color; adv — перевес в пешках
     static const int START[7] = {0, 8, 2, 2, 2, 1, 1};
     static const int PV[7] = {0, 1, 3, 3, 5, 9, 0};
-    int cnt[2][7] = {{0}};
+    int cnt[2][7] = {{0}}, st[2][7] = {{0}};
     const eng::Board &b = gM.g.cur;
     for (int s = 0; s < 64; s++)
         if (b.sq[s]) cnt[eng::pColor(b.sq[s])][eng::pType(b.sq[s])]++;
+    // считаем от позиции, с которой началась партия (своя расстановка — своя точка отсчёта)
+    const eng::Board *sb = gM.g.startFen.empty() ? nullptr : (gM.g.before.empty() ? &gM.g.cur : &gM.g.before[0]);
+    for (int c = 0; c < 2; c++)
+        for (int t = 0; t < 7; t++) st[c][t] = START[t];
+    if (sb) {
+        memset(st, 0, sizeof(st));
+        for (int s = 0; s < 64; s++)
+            if (sb->sq[s]) st[eng::pColor(sb->sq[s])][eng::pType(sb->sq[s])]++;
+    }
     int opp = color ^ 1;
     capt.clear();
     for (int t = eng::QUEEN; t >= eng::PAWN; t--) {
-        int miss = START[t] - cnt[opp][t];
+        int miss = st[opp][t] - cnt[opp][t];
         for (int i = 0; i < miss; i++) capt.push_back(eng::mkPiece(opp, t));
     }
     int m[2] = {0, 0};
@@ -4101,12 +5409,27 @@ static float animT() {
     return 1 - (1 - t) * (1 - t) * (1 - t);
 }
 
+static void drawArrow(float x1, float y1, float x2, float y2, float w, Col c) {
+    float dx = x2 - x1, dy = y2 - y1;
+    float L = std::sqrt(dx * dx + dy * dy);
+    if (L < 1) return;
+    float ux = dx / L, uy = dy / L;
+    float head = w * 2.4f;
+    float hx = x2 - ux * head, hy = y2 - uy * head;
+    thickLine(x1, y1, hx, hy, w, c, false);
+    Poly t;
+    t.push_back(P(x2, y2));
+    t.push_back(P(hx - uy * w * 1.5f, hy + ux * w * 1.5f));
+    t.push_back(P(hx + uy * w * 1.5f, hy - ux * w * 1.5f));
+    fillConvex(t, solid(c));
+}
+
 static void drawBoard(const GameLayout &L) {
     float U = uiU();
     float fr = std::max(3.0f, L.cell * 0.09f);
     fillRRect(L.bx - fr, L.by - fr, L.S + 2 * fr, L.S + 2 * fr, fr * 1.2f, C(0, 0, 0, 90));
     fillRRect(L.bx - fr, L.by - fr + 1, L.S + 2 * fr, L.S + 2 * fr, fr * 1.2f, vgrad(C(96, 66, 42), C(58, 38, 24), L.by, L.by + L.S));
-    const eng::Board &b = gM.g.cur;
+    const eng::Board &b = viewBoard();
     for (int s = 0; s < 64; s++) {
         float x, y;
         sqToXY(L, s, x, y);
@@ -4114,9 +5437,9 @@ static void drawBoard(const GameLayout &L) {
         Col c = light ? COL_LIGHT : COL_DARK;
         fillRect(x, y, L.cell, L.cell, c);
     }
-    // последний ход
-    if (!gM.g.moves.empty()) {
-        eng::Move m = gM.g.moves.back();
+    // последний ход (или ход, на котором остановлен просмотр)
+    if (viewPly() > 0) {
+        eng::Move m = gM.g.moves[(size_t)viewPly() - 1];
         float x, y;
         sqToXY(L, eng::mFrom(m), x, y);
         fillRect(x, y, L.cell, L.cell, C(246, 222, 60, 95));
@@ -4150,7 +5473,7 @@ static void drawBoard(const GameLayout &L) {
     }
     // фигуры
     float at = animT();
-    bool animating = at < 1.0f;
+    bool animating = at < 1.0f && !viewing();
     for (int s = 0; s < 64; s++) {
         if (!b.sq[s]) continue;
         if (gDrag.active && gDrag.started && s == gDrag.sq) continue;
@@ -4180,6 +5503,31 @@ static void drawBoard(const GameLayout &L) {
         if (b.sq[t] || (eng::mFlags(m) & eng::F_EP)) ringShape(cx, cy, L.cell * 0.40f, L.cell * 0.49f, C(20, 60, 20, 95));
         else fillCircle(cx, cy, L.cell * 0.16f, C(20, 60, 20, 90));
     }
+    // свои стрелки и кружки
+    {
+        Col ac = C(21, 140, 40, 175);
+        float aw = std::max(3.0f, L.cell * 0.17f);
+        for (int c : gUCircles) {
+            float x, y;
+            sqToXY(L, c, x, y);
+            ringShape(x + L.cell * 0.5f, y + L.cell * 0.5f, L.cell * 0.42f, L.cell * 0.49f, ac);
+        }
+        auto arrowSq = [&](int a, int b2, Col col) {
+            float x0, y0, x1, y1;
+            sqToXY(L, a, x0, y0);
+            sqToXY(L, b2, x1, y1);
+            float cx0 = x0 + L.cell * 0.5f, cy0 = y0 + L.cell * 0.5f, cx1 = x1 + L.cell * 0.5f, cy1 = y1 + L.cell * 0.5f;
+            float dx = cx1 - cx0, dy = cy1 - cy0, len = std::sqrt(dx * dx + dy * dy);
+            if (len < 1) return;
+            float off = L.cell * 0.18f;  // начинаем чуть от центра клетки
+            drawArrow(cx0 + dx / len * off, cy0 + dy / len * off, cx1, cy1, aw, col);
+        };
+        for (auto &u : gUArrows) arrowSq(u.a, u.b, ac);
+        if (gArrowDrag && gArrowFrom >= 0) {
+            int hs = xyToSq(L, gPtr.x, gPtr.y);
+            if (hs >= 0 && hs != gArrowFrom) arrowSq(gArrowFrom, hs, C(21, 140, 40, 120));
+        }
+    }
     // перетаскивание
     if (gDrag.active && gDrag.started && gSel >= 0) {
         int hs = xyToSq(L, gPtr.x, gPtr.y);
@@ -4202,6 +5550,13 @@ static void drawBoard(const GameLayout &L) {
 static std::string statusText(Col &c) {
     c = COL_TEXT;
     const Game &g = gM.g;
+    if (viewing()) {
+        c = C(140, 196, 255);
+        if (gViewPly == 0) return "ПРОСМОТР: НАЧАЛО ПАРТИИ";
+        int i = gViewPly - 1;
+        int p = i + g.off();
+        return "ПРОСМОТР: " + std::to_string(p / 2 + 1) + (p % 2 ? "... " : ". ") + g.san[(size_t)i];
+    }
     if (g.result != RES_NONE) {
         c = COL_GOLD;
         if (g.result == RES_DRAW) return "НИЧЬЯ";
@@ -4233,61 +5588,109 @@ static std::string statusText(Col &c) {
     return s;
 }
 
+struct ListGeo {
+    float y0, lineH, numW, plyW, colW, sy;
+    int lts, sts, rowsVis, cols, totalRows, firstRow, nPairs;
+};
+static ListGeo listGeo(const GameLayout &L, const std::string &st) {
+    ListGeo G;
+    float U = uiU();
+    G.sy = L.listY + U * 2.2f;
+    G.sts = fitScale(st, L.listW - U * 6, L.ts);
+    G.y0 = G.sy + textH(G.sts) + U * 2.5f;
+    G.lts = L.tsSmall;
+    G.lineH = textH(G.lts) + U * 2.2f;
+    G.rowsVis = std::max(0, (int)((L.navY - U * 1.2f - G.y0) / G.lineH));
+    G.nPairs = (int)(gM.g.san.size() + gM.g.off() + 1) / 2;
+    G.numW = (float)textW("000.", G.lts);
+    G.plyW = (float)textW("Крxe8+ ", G.lts);
+    float pairW = G.numW + 2 * G.plyW + U * 3;
+    G.cols = std::max(1, (int)((L.listW - U * 4) / pairW));
+    G.totalRows = (G.nPairs + G.cols - 1) / G.cols;
+    int maxScroll = std::max(0, G.totalRows - G.rowsVis);
+    // держим выбранный ход в поле зрения
+    int hl = viewPly() - 1;
+    if (gListFollow && hl >= 0 && G.rowsVis > 0) {
+        int row = ((hl + gM.g.off()) / 2) / G.cols;
+        int first = std::max(0, G.totalRows - G.rowsVis - gListScroll);
+        if (row < first) gListScroll = G.totalRows - G.rowsVis - row;
+        else if (row >= first + G.rowsVis) gListScroll = G.totalRows - row - 1;
+    }
+    if (!viewing() && gListFollow) gListScroll = 0;
+    gListFollow = false;
+    if (gListScroll > maxScroll) gListScroll = maxScroll;
+    if (gListScroll < 0) gListScroll = 0;
+    G.firstRow = std::max(0, G.totalRows - G.rowsVis - gListScroll);
+    G.colW = (L.listW - U * 4) / G.cols;
+    return G;
+}
+
+// Какой ход в списке под пальцем (-1 — никакой)
+static int listHit(const GameLayout &L, float x, float y) {
+    Col c;
+    ListGeo G = listGeo(L, statusText(c));
+    float U = uiU();
+    if (y < G.y0 - U || G.rowsVis <= 0) return -1;
+    int r = (int)std::floor((y - G.y0 + U) / G.lineH);
+    if (r < 0 || r >= G.rowsVis) return -1;
+    int row = G.firstRow + r;
+    int col = (int)std::floor((x - L.listX - U * 2.5f) / G.colW);
+    if (col < 0 || col >= G.cols) return -1;
+    int pi = row * G.cols + col;
+    if (pi >= G.nPairs) return -1;
+    float cx = L.listX + U * 2.5f + col * G.colW + G.numW + U * 1.5f;
+    int k = x < cx + G.plyW ? 0 : 1;
+    int ply = pi * 2 + k - gM.g.off();
+    if (ply < 0) ply = 0;
+    if (ply >= (int)gM.g.san.size()) ply = (int)gM.g.san.size() - 1;
+    return ply;
+}
+
 static void drawMoveList(const GameLayout &L) {
     float U = uiU();
     fillRRect(L.listX, L.listY, L.listW, L.listH, U * 2.2f, C(22, 28, 40, 220));
-    int ts = L.ts;
     Col sc;
     std::string st = statusText(sc);
-    float sy = L.listY + U * 2.2f;
-    int sts = fitScale(st, L.listW - U * 6, ts);
-    text(st, L.listX + U * 3, sy, sts, sc);
-    std::string cnt = gM.g.moves.empty() ? "" : ("ХОД " + std::to_string((gM.g.moves.size() + 1) / 2));
-    if (!cnt.empty() && textW(st, sts) + textW(cnt, L.tsSmall) + U * 10 < L.listW)
-        text(cnt, L.listX + L.listW - U * 3, sy + textH(sts) - textH(L.tsSmall), L.tsSmall, COL_DIM, 2, false);
-    float y0 = sy + textH(sts) + U * 2.5f;
-    fillRect(L.listX + U * 3, y0 - U * 1.2f, L.listW - U * 6, 1, C(255, 255, 255, 25));
-    int lts = L.tsSmall;
-    float lineH = textH(lts) + U * 2.2f;
-    int rowsVis = (int)((L.listY + L.listH - y0 - U * 1.0f) / lineH);
-    if (rowsVis < 1) return;
-    int nPairs = (int)(gM.g.san.size() + 1) / 2;
-    float numW = (float)textW("000.", lts);
-    float plyW = (float)textW("Крxe8+ ", lts);
-    float pairW = numW + 2 * plyW + U * 3;
-    int cols = std::max(1, (int)((L.listW - U * 4) / pairW));
-    int totalRows = (nPairs + cols - 1) / cols;
-    int maxScroll = std::max(0, totalRows - rowsVis);
-    if (gListScroll > maxScroll) gListScroll = maxScroll;
-    if (gListScroll < 0) gListScroll = 0;
-    int firstRow = std::max(0, totalRows - rowsVis - gListScroll);
-    float colW = (L.listW - U * 4) / cols;
-    int lastPly = (int)gM.g.san.size() - 1;
-    for (int r = 0; r < rowsVis; r++) {
-        int row = firstRow + r;
-        if (row >= totalRows) break;
-        for (int c = 0; c < cols; c++) {
-            int pi = row * cols + c;
-            if (pi >= nPairs) break;
-            float x = L.listX + U * 2.5f + c * colW;
-            float y = y0 + r * lineH;
+    ListGeo G = listGeo(L, st);
+    text(st, L.listX + U * 3, G.sy, G.sts, sc);
+    std::string cnt = gM.g.moves.empty() ? "" : ("ХОД " + std::to_string((gM.g.moves.size() + gM.g.off() + 1) / 2));
+    if (!cnt.empty() && textW(st, G.sts) + textW(cnt, L.tsSmall) + U * 10 < L.listW)
+        text(cnt, L.listX + L.listW - U * 3, G.sy + textH(G.sts) - textH(L.tsSmall), L.tsSmall, COL_DIM, 2, false);
+    fillRect(L.listX + U * 3, G.y0 - U * 1.2f, L.listW - U * 6, 1, C(255, 255, 255, 25));
+    int lts = G.lts;
+    int hl = viewPly() - 1;  // подсвеченный ход
+    for (int r = 0; r < G.rowsVis; r++) {
+        int row = G.firstRow + r;
+        if (row >= G.totalRows) break;
+        for (int c = 0; c < G.cols; c++) {
+            int pi = row * G.cols + c;
+            if (pi >= G.nPairs) break;
+            float x = L.listX + U * 2.5f + c * G.colW;
+            float y = G.y0 + r * G.lineH;
             std::string num = std::to_string(pi + 1) + ".";
-            text(num, x + numW - textW(num, lts), y, lts, COL_DIM, 0, false);
+            text(num, x + G.numW - textW(num, lts), y, lts, COL_DIM, 0, false);
             for (int k = 0; k < 2; k++) {
-                int ply = pi * 2 + k;
-                if (ply > lastPly) break;
-                float mx = x + numW + U * 1.5f + k * plyW;
-                if (ply == lastPly) fillRRect(mx - U * 0.8f, y - U * 0.8f, textW(gM.g.san[ply], lts) + U * 1.6f, textH(lts) + U * 1.6f, U * 0.8f, C(236, 186, 92, 70));
-                text(gM.g.san[ply], mx, y, lts, ply == lastPly ? COL_GOLD : COL_TEXT, 0, false);
+                int ply = pi * 2 + k - gM.g.off();
+                float mx = x + G.numW + U * 1.5f + k * G.plyW;
+                if (ply < 0) {
+                    text("...", mx, y, lts, COL_DIM, 0, false);
+                    continue;
+                }
+                if (ply >= (int)gM.g.san.size()) break;
+                bool h = ply == hl;
+                Col hc = viewing() ? C(140, 196, 255, 80) : C(236, 186, 92, 70);
+                if (h) fillRRect(mx - U * 0.8f, y - U * 0.8f, textW(gM.g.san[ply], lts) + U * 1.6f, textH(lts) + U * 1.6f, U * 0.8f, hc);
+                Col tc = h ? (viewing() ? C(170, 214, 255) : COL_GOLD) : (viewing() && ply > hl ? C(120, 126, 140) : COL_TEXT);
+                text(gM.g.san[ply], mx, y, lts, tc, 0, false);
             }
         }
     }
-    if (maxScroll > 0) {
-        // полоса прокрутки
-        float trackH = rowsVis * lineH;
-        float th = std::max(U * 4, trackH * rowsVis / totalRows);
+    int maxScroll = std::max(0, G.totalRows - G.rowsVis);
+    if (maxScroll > 0 && G.rowsVis > 0) {
+        float trackH = G.rowsVis * G.lineH;
+        float th = std::max(U * 4, trackH * G.rowsVis / G.totalRows);
         float tpos = (float)(maxScroll - gListScroll) / maxScroll;
-        fillRRect(L.listX + L.listW - U * 1.6f, y0 + (trackH - th) * tpos, U * 0.8f, th, U * 0.4f, C(255, 255, 255, 60));
+        fillRRect(L.listX + L.listW - U * 1.6f, G.y0 + (trackH - th) * tpos, U * 0.8f, th, U * 0.4f, C(255, 255, 255, 60));
     }
 }
 
@@ -4332,21 +5735,6 @@ static std::vector<std::string> wrapText(const std::string &s, int sc, float max
         pos = e + 1;
     }
     return out;
-}
-
-static void drawArrow(float x1, float y1, float x2, float y2, float w, Col c) {
-    float dx = x2 - x1, dy = y2 - y1;
-    float L = std::sqrt(dx * dx + dy * dy);
-    if (L < 1) return;
-    float ux = dx / L, uy = dy / L;
-    float head = w * 2.4f;
-    float hx = x2 - ux * head, hy = y2 - uy * head;
-    thickLine(x1, y1, hx, hy, w, c, false);
-    Poly t;
-    t.push_back(P(x2, y2));
-    t.push_back(P(hx - uy * w * 1.5f, hy + ux * w * 1.5f));
-    t.push_back(P(hx + uy * w * 1.5f, hy - ux * w * 1.5f));
-    fillConvex(t, solid(c));
 }
 
 static void lessonSqXY(const LessonLayout &L, int s, float &x, float &y) {
@@ -4496,10 +5884,16 @@ static void drawLesson() {
     }
 
     // строка состояния
-    if (p.mode != LM_SHOW) {
+    if (p.mode != LM_SHOW && p.mode != LM_GAME) {
         std::string st;
         Col sc = COL_DIM;
-        if (p.mode == LM_MOVES) {
+        if (gLStatus == 3) {
+            st = "ВЕРНО! СОПЕРНИК ОТВЕЧАЕТ...";
+            sc = C(130, 226, 120);
+        } else if (p.mode == LM_PUZZLE && gLStatus == 0 && gLStep > 0 && !gLShowHint) {
+            st = "ПРОДОЛЖАЙТЕ КОМБИНАЦИЮ";
+            sc = COL_GOLD;
+        } else if (p.mode == LM_MOVES) {
             st = "НАЖИМАЙТЕ НА ТОЧКИ, ЧТОБЫ ПОХОДИТЬ";
         } else if (gLStatus == 1) {
             st = "ВЕРНО! ОТЛИЧНО!";
@@ -4522,7 +5916,19 @@ static void drawLesson() {
     // текст урока с прокруткой
     fillRRect(L.textX, L.textY, L.textW, L.textH, U * 2.2f, C(22, 28, 40, 220));
     float ip = U * 3;
-    auto lines = wrapText(p.text, L.tsB, L.textW - 2 * ip);
+    std::string body = p.text;
+    if (p.mode == LM_GAME && gLGPly > 0) {
+        int i = gLGPly - 1;
+        int idx = i + (gLGPos[0].side == eng::BLACK ? 1 : 0);
+        std::string mv = std::to_string(idx / 2 + 1) + (idx % 2 ? "... " : ". ") + gLGSan[(size_t)i];
+        std::string note;
+        for (auto &nt : gLGNotes)
+            if (nt.first == gLGPly) note = nt.second;
+        body = "ХОД " + mv + " (" + std::to_string(gLGPly) + " ИЗ " + std::to_string(gLGMoves.size()) + ")\n" + (note.empty() ? p.text : note);
+    } else if (p.mode == LM_GAME) {
+        body = std::string(p.text) + "\nВСЕГО ХОДОВ В ПРИМЕРЕ: " + std::to_string(gLGMoves.size()) + ".";
+    }
+    auto lines = wrapText(body, L.tsB, L.textW - 2 * ip);
     float lh = textH(L.tsB) + U * 2.4f;
     float total = lines.size() * lh + 2 * ip - U * 2.4f;
     float maxS = std::max(0.0f, total - L.textH);
@@ -4635,9 +6041,332 @@ static void drawToast() {
     int sc = fitScale(gToast, gW * 0.85f, ts);
     float w = textW(gToast, sc) + U * 8, h = textH(sc) + U * 6;
     float x = (gW - w) * 0.5f, y = gH * 0.80f - h;
+    if (gScreen == SC_EDITOR) y = edLayout().palY1 - h - U * 3;  // не закрывать строку проверки
     fillRRect(x, y + U * 0.6f, w, h, h * 0.5f, C(0, 0, 0, 110));
     fillRRect(x, y, w, h, h * 0.5f, C(236, 230, 214, 245));
     text(gToast, gW * 0.5f, y + (h - textH(sc)) * 0.5f, sc, C(30, 30, 34), 1, false);
+}
+
+// ---------- экран разбора партии ----------
+static const char *CLS_SYM[4] = {"", "?!", "?", "??"};
+static const char *CLS_NAME[4] = {"", "НЕТОЧНОСТЬ", "ОШИБКА", "ГРУБАЯ ОШИБКА"};
+static Col clsCol(int c) {
+    switch (c) {
+        case 1: return C(240, 210, 90);
+        case 2: return C(245, 150, 70);
+        case 3: return C(240, 90, 80);
+        default: return COL_TEXT;
+    }
+}
+static std::string moveLabel(int i) {
+    std::string san = gRv.g.san[(size_t)i];
+    int p = i + gRv.g.off();
+    return std::to_string(p / 2 + 1) + (p % 2 ? "... " : ". ") + san;
+}
+static std::string fmtEval(int whiteScore) {
+    if (std::abs(whiteScore) > eng::MATE - 300) {
+        int plies = eng::MATE - std::abs(whiteScore);
+        return std::string(whiteScore > 0 ? "+" : "-") + "М" + std::to_string((plies + 1) / 2);
+    }
+    char b[32];
+    snprintf(b, sizeof b, "%+.1f", whiteScore / 100.0);
+    return b;
+}
+
+static void rvSqXY(const RvLayout &L, int s, float &x, float &y) {
+    int f = s & 7, r = s >> 3;
+    int col = gRv.wb ? f : 7 - f, row = gRv.wb ? 7 - r : r;
+    x = L.bx + col * L.cell;
+    y = L.by + row * L.cell;
+}
+
+static void drawReview() {
+    drawBackground();
+    RvLayout L = rvLayout();
+    float W = (float)gW, U = uiU();
+    int n = (int)gRv.g.moves.size();
+    text("РАЗБОР ПАРТИИ", W * 0.5f, L.titleY, L.ts + 1, COL_GOLD, 1);
+    // общая оценка игры
+    if (gRv.ready) {
+        auto word = [](int r) -> const char * {
+            if (r >= 10) return "ИДЕАЛЬНО";
+            if (r >= 8) return "ОТЛИЧНО";
+            if (r >= 6) return "ХОРОШО";
+            if (r >= 4) return "СРЕДНЕ";
+            return "СЛАБО";
+        };
+        auto rcol = [](int r) -> Col {
+            if (r >= 8) return C(130, 226, 120);
+            if (r >= 6) return COL_GOLD;
+            if (r >= 4) return C(245, 170, 80);
+            return C(240, 100, 90);
+        };
+        std::string line;
+        Col lc;
+        if (gRv.focus >= 0) {
+            int r = gRv.rate[gRv.focus];
+            line = "ВАША ИГРА: " + std::to_string(r) + " ИЗ 10 · " + word(r);
+            lc = rcol(r);
+        } else {
+            line = "БЕЛЫЕ " + std::to_string(gRv.rate[0]) + " ИЗ 10 · ЧЁРНЫЕ " + std::to_string(gRv.rate[1]) + " ИЗ 10";
+            lc = COL_GOLD;
+        }
+        int rs = fitScale(line, W - 2 * L.pad, L.ts + 2);
+        float bw = textW(line, rs) + U * 8, bh = textH(rs) + U * 3;
+        float bx = (W - bw) * 0.5f, by = L.rateY - U * 1.5f;
+        fillRRect(bx, by, bw, bh, bh * 0.5f, C(255, 255, 255, 18));
+        text(line, W * 0.5f, L.rateY, rs, lc, 1);
+    }
+    // итоги по сторонам
+    if (gRv.ready) {
+        float y = L.sumY;
+        for (int s = 0; s < 2; s++) {
+            std::string who = gRv.mode == MODE_TWO ? sideName(s, true) : (s == gRv.human ? "ВЫ" : (gRv.mode == MODE_BOT ? "БОТ" : "СОПЕРНИК"));
+            std::string a = who + ": " + std::to_string(gRv.rate[s]) + "/10 · ТОЧНОСТЬ " + std::to_string(gRv.acc[s]) + "%";
+            float x = L.pad;
+            text(a, x, y, L.tsS, s == gRv.focus || gRv.focus < 0 ? COL_TEXT : COL_DIM, 0, false);
+            x = W - L.pad;
+            for (int c = 3; c >= 1; c--) {
+                std::string t = std::string(CLS_SYM[c]) + " " + std::to_string(gRv.cnt[s][c]);
+                text(t, x, y, L.tsS, clsCol(c), 2, false);
+                x -= textW(t, L.tsS) + U * 4;
+            }
+            y += textH(L.tsS) + U * 2;
+        }
+    }
+    // доска: позиция перед обсуждаемым ходом
+    int idx = gRv.k - 1;
+    const eng::Board &b = gRv.pos[(size_t)std::max(0, idx)];
+    float fr = std::max(3.0f, L.cell * 0.09f);
+    fillRRect(L.bx - fr, L.by - fr + 1, L.S + 2 * fr, L.S + 2 * fr, fr * 1.2f, vgrad(C(96, 66, 42), C(58, 38, 24), L.by, L.by + L.S));
+    for (int s = 0; s < 64; s++) {
+        float x, y;
+        rvSqXY(L, s, x, y);
+        bool light = ((s & 7) + (s >> 3)) & 1;
+        fillRect(x, y, L.cell, L.cell, light ? COL_LIGHT : COL_DARK);
+    }
+    if (idx >= 1) {  // предыдущий ход соперника
+        eng::Move pm = gRv.g.moves[(size_t)idx - 1];
+        float x, y;
+        rvSqXY(L, eng::mFrom(pm), x, y);
+        fillRect(x, y, L.cell, L.cell, C(246, 222, 60, 80));
+        rvSqXY(L, eng::mTo(pm), x, y);
+        fillRect(x, y, L.cell, L.cell, C(246, 222, 60, 110));
+    }
+    if (b.inCheck(b.side)) {
+        float x, y;
+        rvSqXY(L, b.kingSq[b.side], x, y);
+        radial(x + L.cell * 0.5f, y + L.cell * 0.5f, L.cell * 0.62f, C(255, 30, 20, 230), C(255, 30, 20, 0));
+    }
+    for (int s = 0; s < 64; s++) {
+        if (!b.sq[s]) continue;
+        float x, y;
+        rvSqXY(L, s, x, y);
+        drawPiece(b.sq[s], x, y, L.cell);
+    }
+    float aw = std::max(3.0f, L.cell * 0.15f);
+    if (gRv.ready && idx >= 0 && idx < n) {
+        eng::Move pm = gRv.g.moves[(size_t)idx], bm = gRv.best[(size_t)idx];
+        float x0, y0, x1, y1;
+        if (bm && bm != pm) {
+            rvSqXY(L, eng::mFrom(bm), x0, y0);
+            rvSqXY(L, eng::mTo(bm), x1, y1);
+            drawArrow(x0 + L.cell * 0.5f, y0 + L.cell * 0.5f, x1 + L.cell * 0.5f, y1 + L.cell * 0.5f, aw, C(40, 170, 70, 190));
+        }
+        rvSqXY(L, eng::mFrom(pm), x0, y0);
+        rvSqXY(L, eng::mTo(pm), x1, y1);
+        int c = gRv.cls[(size_t)idx];
+        Col ac = c == 0 ? C(70, 130, 230, 170) : withA(clsCol(c), 200);
+        drawArrow(x0 + L.cell * 0.5f, y0 + L.cell * 0.5f, x1 + L.cell * 0.5f, y1 + L.cell * 0.5f, aw, ac);
+    }
+    // шкала оценки
+    if (gRv.ready) {
+        float f = (winChance(rvWhiteScore(std::max(0, idx))) + 1) * 0.5f;
+        fillRRect(L.bx, L.evalY, L.S, L.evalH, L.evalH * 0.5f, C(30, 30, 34));
+        fillRRect(L.bx, L.evalY, std::max(L.evalH, L.S * f), L.evalH, L.evalH * 0.5f, C(236, 232, 222));
+        fillRect(L.bx + L.S * 0.5f - 1, L.evalY - U * 0.6f, 2, L.evalH + U * 1.2f, C(236, 186, 92));
+    }
+    // описание хода
+    float y = L.infoY;
+    float lh = textH(L.ts) + U * 2;
+    if (!gRv.ready) {
+        int prog = gRvJob ? gRvJob->progress.load() : 0;
+        int total = n + 1;
+        text("АНАЛИЗ ПАРТИИ...", W * 0.5f, y, L.ts, COL_TEXT, 1);
+        float bw = L.S, bx = (W - bw) * 0.5f, by = y + lh + U * 2;
+        fillRRect(bx, by, bw, U * 3, U * 1.5f, C(30, 38, 52));
+        fillRRect(bx, by, std::max(U * 3, bw * prog / std::max(1, total)), U * 3, U * 1.5f, COL_GOLD);
+        text(std::to_string(prog * 100 / std::max(1, total)) + "%", W * 0.5f, by + U * 5, L.tsS, COL_DIM, 1, false);
+    } else if (idx < 0) {
+        text("НАЧАЛО ПАРТИИ", L.pad, y, L.ts, COL_TEXT);
+        text("ЛИСТАЙТЕ ХОДЫ ИЛИ ВЫБЕРИТЕ ОШИБКУ НИЖЕ", L.pad, y + lh, fitScale("ЛИСТАЙТЕ ХОДЫ ИЛИ ВЫБЕРИТЕ ОШИБКУ НИЖЕ", W - 2 * L.pad, L.tsS), COL_DIM, 0, false);
+    } else {
+        int c = gRv.cls[(size_t)idx];
+        std::string l1 = moveLabel(idx) + CLS_SYM[c];
+        text(l1, L.pad, y, L.ts, clsCol(c));
+        std::string tag = c ? CLS_NAME[c] : (gRv.isBest[(size_t)idx] ? "ЛУЧШИЙ ХОД" : "ХОРОШИЙ ХОД");
+        Col tc = c ? clsCol(c) : C(130, 220, 120);
+        int tgs = fitScale(tag, W - 2 * L.pad - textW(l1, L.ts) - U * 4, L.tsS);
+        text(tag, W - L.pad, y + textH(L.ts) - textH(tgs), tgs, tc, 2, false);
+        y += lh;
+        if (!gRv.isBest[(size_t)idx] && gRv.best[(size_t)idx]) {
+            std::string bs = "ЛУЧШЕ: " + eng::toSAN(gRv.pos[(size_t)idx], gRv.best[(size_t)idx]);
+            text(bs, L.pad, y, L.tsS, C(130, 220, 120), 0, false);
+        } else {
+            text("ЭТО ХОД ДВИЖКА", L.pad, y, L.tsS, C(130, 220, 120), 0, false);
+        }
+        y += textH(L.tsS) + U * 2;
+        std::string ev = "ОЦЕНКА: " + fmtEval(rvWhiteScore(idx)) + " -> " + fmtEval(rvWhiteScore(idx + 1));
+        text(ev, L.pad, y, L.tsS, COL_DIM, 0, false);
+    }
+    // список ошибок
+    if (gRv.ready && L.listH > U * 6) {
+        fillRRect(L.pad, L.listY, W - 2 * L.pad, L.listH, U * 2.2f, C(22, 28, 40, 220));
+        std::string hdr = gRv.focus < 0 ? "ОШИБКИ В ПАРТИИ" : "ВАШИ ОШИБКИ";
+        text(hdr, L.pad + U * 3, L.listY + U * 2, L.tsS, COL_GOLD, 0, false);
+        float ly0 = L.listY + U * 3 + textH(L.tsS) + U * 2;
+        float rh = L.rowH;
+        float areaH = L.listY + L.listH - ly0 - U * 1.5f;
+        float total = gRv.list.size() * rh;
+        float maxS = std::max(0.0f, total - areaH);
+        if (gRv.scroll > maxS) gRv.scroll = maxS;
+        if (gRv.scroll < 0) gRv.scroll = 0;
+        if (gRv.list.empty()) {
+            drawTextBlock("ОШИБОК НЕ НАЙДЕНО. ОТЛИЧНАЯ ИГРА!", L.pad + U * 3, ly0, W - 2 * L.pad - U * 6, L.tsS, C(130, 220, 120), 0);
+        } else {
+            SDL_Rect clip;
+            clip.x = (int)L.pad;
+            clip.y = (int)ly0;
+            clip.w = (int)(W - 2 * L.pad);
+            clip.h = (int)std::max(1.0f, areaH);
+            SDL_RenderSetClipRect(R, &clip);
+            float ry = ly0 - gRv.scroll;
+            for (int i : gRv.list) {
+                if (ry + rh > ly0 && ry < ly0 + areaH) {
+                    int c = gRv.cls[(size_t)i];
+                    if (i == idx) fillRRect(L.pad + U * 1.5f, ry - U * 0.8f, W - 2 * L.pad - U * 3, rh - U * 0.4f, U, C(255, 255, 255, 22));
+                    std::string a = moveLabel(i) + CLS_SYM[c];
+                    text(a, L.pad + U * 3, ry, L.tsS, clsCol(c), 0, false);
+                    if (gRv.best[(size_t)i]) {
+                        std::string bb = "ЛУЧШЕ " + eng::toSAN(gRv.pos[(size_t)i], gRv.best[(size_t)i]);
+                        text(bb, W - L.pad - U * 3, ry, L.tsS, C(130, 200, 120), 2, false);
+                    }
+                }
+                ry += rh;
+            }
+            SDL_RenderSetClipRect(R, nullptr);
+        }
+    }
+    drawButtons(gScreenBtns, gOverlay == OV_NONE);
+}
+
+// какая строка списка ошибок под пальцем
+static int rvListHit(float x, float y) {
+    RvLayout L = rvLayout();
+    float U = uiU();
+    float ly0 = L.listY + U * 3 + textH(L.tsS) + U * 2;
+    if (x < L.pad || x > gW - L.pad || y < ly0 || y > L.listY + L.listH) return -1;
+    int r = (int)std::floor((y - ly0 + gRv.scroll + U * 0.8f) / L.rowH);
+    if (r < 0 || r >= (int)gRv.list.size()) return -1;
+    return gRv.list[(size_t)r];
+}
+
+// ---------- экран расстановки фигур ----------
+static void edSqXY(const EdLayout &L, int s, float &x, float &y) {
+    x = L.bx + (s & 7) * L.cell;
+    y = L.by + (7 - (s >> 3)) * L.cell;
+}
+static int edXYToSq(const EdLayout &L, float x, float y) {
+    if (x < L.bx || y < L.by || x >= L.bx + L.S || y >= L.by + L.S) return -1;
+    int col = (int)((x - L.bx) / L.cell), row = (int)((y - L.by) / L.cell);
+    if (col < 0 || col > 7 || row < 0 || row > 7) return -1;
+    return (7 - row) * 8 + col;
+}
+
+static void drawEditor() {
+    drawBackground();
+    EdLayout L = edLayout();
+    float W = (float)gW, U = uiU();
+    int tsT = fitScale("РАССТАНОВКА ФИГУР", W - 2 * L.pad, L.ts + 1);
+    text("РАССТАНОВКА ФИГУР", W * 0.5f, L.titleY, tsT, COL_GOLD, 1);
+    // доска
+    float fr = std::max(3.0f, L.cell * 0.09f);
+    fillRRect(L.bx - fr, L.by - fr + 1, L.S + 2 * fr, L.S + 2 * fr, fr * 1.2f, vgrad(C(96, 66, 42), C(58, 38, 24), L.by, L.by + L.S));
+    for (int s = 0; s < 64; s++) {
+        float x, y;
+        edSqXY(L, s, x, y);
+        bool light = ((s & 7) + (s >> 3)) & 1;
+        fillRect(x, y, L.cell, L.cell, light ? COL_LIGHT : COL_DARK);
+    }
+    int cs = std::max(1, (int)(L.cell / 30.0f));
+    for (int i = 0; i < 8; i++) {
+        std::string fs(1, (char)('a' + i)), rs(1, (char)('8' - i));
+        text(fs, L.bx + i * L.cell + L.cell - textW(fs, cs) - cs * 1.5f, L.by + 8 * L.cell - textH(cs) - cs * 1.2f, cs,
+             (i & 1) ? COL_DARK : COL_LIGHT, 0, false);
+        text(rs, L.bx + cs * 1.5f, L.by + i * L.cell + cs * 1.2f, cs, (i & 1) ? COL_DARK : COL_LIGHT, 0, false);
+    }
+    bool dragBoard = gEdDown && gEdMoved && gEdFrom >= 0 && gEdSq[gEdFrom];
+    bool dragPal = gPtr.down && gPressed >= B_ED_PAL0 && gPressed < B_ED_PAL0 + 12;
+    if (dragPal) {
+        dragPal = false;
+        for (auto &b : gScreenBtns)
+            if (b.id == gPressed && !inRect(b.r, gPtr.x, gPtr.y)) dragPal = true;
+    }
+    // король под шахом — подсветка
+    {
+        eng::Board b;
+        bool kings = false;
+        int wk = 0, bk = 0;
+        for (int i = 0; i < 64; i++) {
+            if (gEdSq[i] == eng::mkPiece(eng::WHITE, eng::KING)) wk++;
+            if (gEdSq[i] == eng::mkPiece(eng::BLACK, eng::KING)) bk++;
+        }
+        kings = wk == 1 && bk == 1;
+        if (kings && b.setFEN(edFen()))
+            for (int c = 0; c < 2; c++)
+                if (b.inCheck(c)) {
+                    float x, y;
+                    edSqXY(L, b.kingSq[c], x, y);
+                    radial(x + L.cell * 0.5f, y + L.cell * 0.5f, L.cell * 0.62f, C(255, 30, 20, 230), C(255, 30, 20, 0));
+                }
+    }
+    for (int s = 0; s < 64; s++) {
+        if (!gEdSq[s] || (dragBoard && s == gEdFrom)) continue;
+        float x, y;
+        edSqXY(L, s, x, y);
+        drawPiece(gEdSq[s], x, y, L.cell);
+    }
+    if (dragBoard || dragPal) {
+        int hs = edXYToSq(L, gPtr.x, gPtr.y);
+        if (hs >= 0) {
+            float x, y;
+            edSqXY(L, hs, x, y);
+            float w = std::max(2.0f, L.cell * 0.06f);
+            Col hc = C(255, 255, 255, 170);
+            fillRect(x, y, L.cell, w, hc);
+            fillRect(x, y + L.cell - w, L.cell, w, hc);
+            fillRect(x, y, w, L.cell, hc);
+            fillRect(x + L.cell - w, y, w, L.cell, hc);
+        }
+    }
+    // счёт фигур и проверка
+    int wt, wp, bt, bp;
+    edCount(eng::WHITE, wt, wp);
+    edCount(eng::BLACK, bt, bp);
+    std::string cnt = "БЕЛЫХ " + std::to_string(wt) + " (ПЕШЕК " + std::to_string(wp) + ") · ЧЁРНЫХ " + std::to_string(bt) +
+                      " (ПЕШЕК " + std::to_string(bp) + ")";
+    text(cnt, W * 0.5f, L.infoY, fitScale(cnt, W - 2 * L.pad, L.tsS), COL_DIM, 1, false);
+    std::string msg;
+    bool ok = edCheck(msg);
+    text(msg, W * 0.5f, L.infoY + textH(L.tsS) + U * 2.5f, fitScale(msg, W - 2 * L.pad, L.tsS), ok ? C(130, 226, 120) : C(240, 110, 96), 1, false);
+    drawButtons(gScreenBtns, gOverlay == OV_NONE);
+    // фигура в пальце
+    float ds = L.cell * 1.3f;
+    if (dragBoard) drawPiece(gEdSq[gEdFrom], gPtr.x - ds * 0.5f, gPtr.y - ds * 0.85f, ds);
+    if (dragPal) {
+        int i = gPressed - B_ED_PAL0;
+        drawPiece(eng::mkPiece(i / 6, ED_TYPES[i % 6]), gPtr.x - ds * 0.5f, gPtr.y - ds * 0.85f, ds);
+    }
 }
 
 // ---------- окна поверх ----------
@@ -4687,8 +6416,14 @@ static void drawOverlay() {
         int s1 = fitScale(q1, p.w * 0.9f, ts + 2), s2 = fitScale(q2, p.w * 0.9f, ts);
         text(q1, p.x + p.w * 0.5f, p.y + U * 8, s1, COL_GOLD, 1);
         text(q2, p.x + p.w * 0.5f, p.y + U * 8 + textH(s1) + U * 5, s2, COL_DIM, 1, false);
+    } else if (gOverlay == OV_CHOOSE) {
+        Panel p = overlayPanel(78);
+        drawPanel(p);
+        text("КАК ИГРАТЬ?", p.x + p.w * 0.5f, p.y + U * 7, fitScale("КАК ИГРАТЬ?", p.w * 0.9f, ts + 2), COL_GOLD, 1);
+        std::string sub = "В ВАШЕЙ РАССТАНОВКЕ";
+        text(sub, p.x + p.w * 0.5f, p.y + U * 7 + textH(ts + 2) + U * 3, fitScale(sub, p.w * 0.9f, ts), COL_DIM, 1, false);
     } else if (gOverlay == OV_RESULT) {
-        Panel p = overlayPanel(106);
+        Panel p = overlayPanel(120);
         drawPanel(p);
         const Game &g = gM.g;
         std::string t1;
@@ -4717,7 +6452,7 @@ static void drawOverlay() {
         int s2 = fitScale(r, p.w * 0.9f, ts);
         text(r, p.x + p.w * 0.5f, cy, s2, COL_TEXT, 1, false);
         cy += textH(s2) + U * 3;
-        std::string mv = "ХОДОВ: " + std::to_string((g.moves.size() + 1) / 2);
+        std::string mv = "ХОДОВ: " + std::to_string((g.moves.size() + g.off() + 1) / 2);
         text(mv, p.x + p.w * 0.5f, cy, std::max(1, ts - 1), COL_DIM, 1, false);
     } else if (gOverlay == OV_PROMO) {
         Panel p = overlayPanel(50);
@@ -4741,6 +6476,8 @@ static void render() {
         case SC_LEARN: drawLearn(); break;
         case SC_LESSON: drawLesson(); break;
         case SC_NET: drawNet(); break;
+        case SC_REVIEW: drawReview(); break;
+        case SC_EDITOR: drawEditor(); break;
         case SC_GAME: drawGame(); break;
     }
     drawOverlay();
@@ -4751,7 +6488,9 @@ static void render() {
 //                              ВВОД
 // =====================================================================
 static void goMenu() {
+    cancelReview();
     if (gM.mode == MODE_NET) netLeave(true);
+    gViewPly = -1;
     cancelBot();
     clearSel();
     gOverlay = OV_NONE;
@@ -4811,18 +6550,45 @@ static void onButton(int id) {
             clearSel();
             startBot();
             break;
-        case B_PLAY_BOT: gSetupMode = MODE_BOT; gScreen = SC_SETUP; break;
-        case B_PLAY_TWO: gSetupMode = MODE_TWO; gScreen = SC_SETUP; break;
+        case B_PLAY_BOT: gCustomFen.clear(); gSetupMode = MODE_BOT; gScreen = SC_SETUP; break;
+        case B_PLAY_TWO: gCustomFen.clear(); gSetupMode = MODE_TWO; gScreen = SC_SETUP; break;
+        case B_EDITOR: edEnsure(); gScreen = SC_EDITOR; break;
+        case B_ED_ERASER: gEdTool = 0; break;
+        case B_ED_WHITE: gEdSide = eng::WHITE; break;
+        case B_ED_BLACK: gEdSide = eng::BLACK; break;
+        case B_ED_CLEAR: edClear(); break;
+        case B_ED_START: {
+            eng::Board b;
+            b.setStart();
+            edLoadBoard(b);
+            break;
+        }
+        case B_ED_GAME:
+            if (gM.active) edLoadBoard(gM.g.cur);
+            break;
+        case B_ED_PLAY: {
+            std::string m;
+            if (edCheck(m)) gOverlay = OV_CHOOSE;
+            else toast(m);
+            break;
+        }
+        case B_ED_BOT:
+        case B_ED_TWO:
+            gOverlay = OV_NONE;
+            gCustomFen = edFen();
+            gSetupMode = id == B_ED_BOT ? MODE_BOT : MODE_TWO;
+            gScreen = SC_SETUP;
+            break;
         case B_STATS: gScreen = SC_STATS; break;
         case B_SOUND: gSoundOn = !gSoundOn; saveAll(); break;
         case B_EXIT: gRunning = false; break;
         case B_LVL1: case B_LVL2: case B_LVL3: case B_LVL4: case B_LVL5: gSet.level = id - B_LVL1 + 1; saveAll(); break;
         case B_COL_W: case B_COL_B: case B_COL_R: gSet.color = id - B_COL_W; saveAll(); break;
         case B_CLK0: case B_CLK1: case B_CLK2: case B_CLK3: gSet.clock = id - B_CLK0; saveAll(); break;
-        case B_START: newMatch(gSetupMode, gSet.level, gSetupMode == MODE_BOT ? gSet.color : 0, gSet.clock); break;
+        case B_START: newMatch(gSetupMode, gSet.level, gSetupMode == MODE_BOT ? gSet.color : 0, gSet.clock, gCustomFen); break;
         case B_BACK:
             if (gScreen == SC_NET) netCloseAll();
-            gScreen = SC_MENU;
+            gScreen = (gScreen == SC_SETUP && !gCustomFen.empty()) ? SC_EDITOR : SC_MENU;
             break;
         case B_UNDO: doUndo(); break;
         case B_RESIGN: gConfirm = CF_RESIGN; gOverlay = OV_CONFIRM; clearSel(); break;
@@ -4833,6 +6599,35 @@ static void onButton(int id) {
             else restartSame();
             break;
         case B_DRAW: netOffer("DRAW"); break;
+        case B_REVIEW:
+        case B_RES_REVIEW: startReview(); break;
+        case B_RV_FIRST: gRv.k = 0; break;
+        case B_RV_PREV: gRv.k = std::max(0, gRv.k - 1); break;
+        case B_RV_NEXT: gRv.k = std::min((int)gRv.g.moves.size(), gRv.k + 1); break;
+        case B_RV_LAST: gRv.k = (int)gRv.g.moves.size(); break;
+        case B_RV_MIST: gRv.k = rvNextMistake(gRv.k); break;
+        case B_RV_DONE: leaveReview(); break;
+        case B_LG_FIRST: gLGAuto = false; lessonGameShow(0); break;
+        case B_LG_PREV: gLGAuto = false; lessonGameShow(gLGPly - 1); break;
+        case B_LG_NEXT: gLGAuto = false; lessonGameShow(gLGPly + 1); break;
+        case B_LG_LAST: gLGAuto = false; lessonGameShow((int)gLGMoves.size()); break;
+        case B_LG_PLAY:
+            if (gLGAuto) gLGAuto = false;
+            else {
+                if (gLGPly >= (int)gLGMoves.size()) lessonGameShow(0);
+                gLGAuto = true;
+                gLGNext = SDL_GetTicks() + 700;
+            }
+            break;
+        case B_ARROWS:
+            gArrowMode = !gArrowMode;
+            clearSel();
+            toast(gArrowMode ? "СТРЕЛКИ: ВЕДИТЕ ПАЛЬЦЕМ ПО ДОСКЕ" : "СТРЕЛКИ ВЫКЛЮЧЕНЫ");
+            break;
+        case B_NAV_FIRST: navTo(0); break;
+        case B_NAV_PREV: navTo(viewPly() - 1); break;
+        case B_NAV_NEXT: navTo(viewPly() + 1); break;
+        case B_NAV_LAST: navTo((int)gM.g.moves.size()); break;
         case B_PLAY_NET:
             gScreen = SC_NET;
             gNetUI = NU_MENU;
@@ -4944,6 +6739,11 @@ static void onButton(int id) {
             break;
         }
         default:
+            if (id >= B_ED_PAL0 && id <= B_ED_PAL_END) {
+                int i = id - B_ED_PAL0;
+                gEdTool = eng::mkPiece(i / 6, ED_TYPES[i % 6]);
+                break;
+            }
             if (id >= B_CH0 && id < B_CH0 + NCHAP) {
                 openLesson(id - B_CH0, 0);
                 gLScroll = 0;
@@ -4962,7 +6762,9 @@ static void onBack() {
     switch (gScreen) {
         case SC_GAME: leaveGameAsk(); break;
         case SC_NET: netCancel(); break;
-        case SC_SETUP: case SC_STATS: case SC_LEARN: gScreen = SC_MENU; break;
+        case SC_REVIEW: leaveReview(); break;
+        case SC_SETUP: gScreen = gCustomFen.empty() ? SC_MENU : SC_EDITOR; break;
+        case SC_EDITOR: case SC_STATS: case SC_LEARN: gScreen = SC_MENU; break;
         case SC_LESSON: gScreen = SC_LEARN; break;
         default: gRunning = false; break;
     }
@@ -4986,6 +6788,23 @@ static void pointerDown(float x, float y) {
         gPtr.outside = true;
         return;
     }
+    if (gScreen == SC_EDITOR) {
+        int s = edXYToSq(edLayout(), x, y);
+        gEdDown = s >= 0;
+        gEdFrom = s;
+        gEdMoved = false;
+        return;
+    }
+    if (gScreen == SC_REVIEW) {
+        RvLayout RL = rvLayout();
+        if (gRv.ready && y >= RL.listY && y < RL.listY + RL.listH) {
+            gRvDrag = true;
+            gRv.scrollStart = gRv.scroll;
+        } else if (gRv.ready && x >= RL.bx && x < RL.bx + RL.S && y >= RL.by && y < RL.by + RL.S) {
+            gRv.k = std::min((int)gRv.g.moves.size(), gRv.k + 1);  // нажатие на доску — следующий ход
+        }
+        return;
+    }
     if (gScreen == SC_LESSON) {
         LessonLayout LL = lessonLayout();
         int ls = lessonXYToSq(LL, x, y);
@@ -5004,8 +6823,20 @@ static void pointerDown(float x, float y) {
         return;
     }
     int s = xyToSq(L, x, y);
+    if (s >= 0 && viewing()) {  // нажали на доску во время просмотра — к текущей позиции
+        navTo((int)gM.g.moves.size());
+        return;
+    }
     if (s < 0) { clearSel(); return; }
-    if (!canHumanMove()) return;
+    auto startArrow = [&]() {
+        gArrowDrag = true;
+        gArrowFrom = s;
+    };
+    if (gArrowMode || !canHumanMove()) {  // рисуем стрелку
+        clearSel();
+        startArrow();
+        return;
+    }
     const eng::Board &b = gM.g.cur;
     if (gSel >= 0 && isTarget(s)) {
         tryMove(gSel, s, true);
@@ -5022,12 +6853,23 @@ static void pointerDown(float x, float y) {
         return;
     }
     clearSel();
+    startArrow();  // от пустой клетки или фигуры соперника — стрелка
 }
 
 static void pointerMove(float x, float y) {
     gPtr.x = x;
     gPtr.y = y;
     if (!gPtr.down) return;
+    if (gEdDown) {
+        float dx = x - gPtr.sx, dy = y - gPtr.sy;
+        float th = edLayout().cell * 0.2f;
+        if (dx * dx + dy * dy > th * th) gEdMoved = true;
+        return;
+    }
+    if (gRvDrag) {
+        gRv.scroll = gRv.scrollStart - (y - gPtr.sy);
+        return;
+    }
     if (gLessonDrag) {
         gLScroll = gLScrollStart - (y - gPtr.sy);
         if (gLScroll < 0) gLScroll = 0;
@@ -5054,6 +6896,16 @@ static void pointerUp(float x, float y) {
     if (gPressed >= 0) {
         int id = gPressed;
         gPressed = -1;
+        // фигуру из палитры перетащили на доску
+        if (gScreen == SC_EDITOR && id >= B_ED_PAL0 && id <= B_ED_PAL_END) {
+            int sq = edXYToSq(edLayout(), x, y);
+            if (sq >= 0) {
+                int i = id - B_ED_PAL0;
+                gEdTool = eng::mkPiece(i / 6, ED_TYPES[i % 6]);
+                if (edPlace(sq, gEdTool, false)) playSound(SND_MOVE);
+                return;
+            }
+        }
         for (auto &b : activeBtns())
             if (b.id == id && b.enabled && inRect(b.r, x, y)) {
                 onButton(id);
@@ -5064,11 +6916,60 @@ static void pointerUp(float x, float y) {
     if (gPtr.outside) {
         gPtr.outside = false;
         if (gOverlay == OV_PROMO) { gOverlay = OV_NONE; clearSel(); }
-        else if (gOverlay == OV_CONFIRM) confirmCancel();
+        else if (gOverlay == OV_CONFIRM || gOverlay == OV_CHOOSE) confirmCancel();
+        return;
+    }
+    if (gEdDown) {
+        gEdDown = false;
+        int to = edXYToSq(edLayout(), x, y);
+        if (!gEdMoved) {
+            if (to >= 0) edTap(to);
+        } else if (gEdFrom >= 0 && gEdSq[gEdFrom]) {
+            if (to < 0) {  // унесли фигуру за доску — удалить
+                gEdSq[gEdFrom] = 0;
+                playSound(SND_CAPTURE);
+            } else {
+                edMove(gEdFrom, to);
+            }
+        } else if (to >= 0) {
+            edTap(to);
+        }
+        gEdFrom = -1;
+        return;
+    }
+    if (gRvDrag) {
+        gRvDrag = false;
+        float dx = x - gPtr.sx, dy = y - gPtr.sy;
+        if (dx * dx + dy * dy < uiU() * uiU() * 9) {
+            int i = rvListHit(x, y);
+            if (i >= 0) {
+                gRv.k = i + 1;
+                playSound(SND_CLICK);
+            }
+        }
         return;
     }
     if (gLessonDrag) { gLessonDrag = false; return; }
-    if (gPtr.listDrag) { gPtr.listDrag = false; return; }
+    if (gPtr.listDrag) {
+        gPtr.listDrag = false;
+        float dx = x - gPtr.sx, dy = y - gPtr.sy;
+        if (gScreen == SC_GAME && dx * dx + dy * dy < uiU() * uiU() * 9) {
+            int ply = listHit(gameLayout(), x, y);
+            if (ply >= 0) {
+                navTo(ply + 1);
+                playSound(SND_CLICK);
+            }
+        }
+        return;
+    }
+    if (gScreen == SC_GAME && gArrowDrag) {
+        gArrowDrag = false;
+        int to = xyToSq(gameLayout(), x, y);
+        if (to >= 0 && to != gArrowFrom) toggleArrow(gArrowFrom, to);
+        else if (to >= 0 && to == gArrowFrom && gArrowMode) toggleCircle(to);
+        else if (to >= 0 && to == gArrowFrom && !gUArrows.empty() && !gArrowMode) clearUserMarks();  // тап — стереть
+        return;
+    }
     if (gScreen == SC_GAME && gDrag.active) {
         gDrag.active = false;
         if (gDrag.started) {
@@ -5127,6 +7028,12 @@ static void handleEvent(const SDL_Event &e) {
         case SDL_KEYDOWN:
             if (e.key.repeat) break;
             if (e.key.keysym.sym == SDLK_AC_BACK || e.key.keysym.sym == SDLK_ESCAPE) onBack();
+            if (gScreen == SC_GAME && gOverlay == OV_NONE) {
+                if (e.key.keysym.sym == SDLK_LEFT) navTo(viewPly() - 1);
+                if (e.key.keysym.sym == SDLK_RIGHT) navTo(viewPly() + 1);
+                if (e.key.keysym.sym == SDLK_HOME || e.key.keysym.sym == SDLK_UP) navTo(0);
+                if (e.key.keysym.sym == SDLK_END || e.key.keysym.sym == SDLK_DOWN) navTo((int)gM.g.moves.size());
+            }
 #if !defined(__ANDROID__)
             if (e.key.keysym.sym == SDLK_F11) {
                 Uint32 fl = SDL_GetWindowFlags(gWin);
@@ -5149,7 +7056,19 @@ static void handleEvent(const SDL_Event &e) {
             if (gPtr.down && gPtr.finger && gPtr.fid == e.tfinger.fingerId) pointerUp(e.tfinger.x * gW, e.tfinger.y * gH);
             break;
         case SDL_MOUSEBUTTONDOWN:
-            if (e.button.which == SDL_TOUCH_MOUSEID || e.button.button != SDL_BUTTON_LEFT) break;
+            if (e.button.which == SDL_TOUCH_MOUSEID) break;
+            if (e.button.button == SDL_BUTTON_RIGHT && gScreen == SC_GAME && gOverlay == OV_NONE && !gPtr.down) {
+                int sq = xyToSq(gameLayout(), e.button.x * gMouseSX, e.button.y * gMouseSY);
+                if (sq >= 0) {
+                    clearSel();
+                    gArrowDrag = true;
+                    gArrowFrom = sq;
+                    gPtr.x = e.button.x * gMouseSX;
+                    gPtr.y = e.button.y * gMouseSY;
+                }
+                break;
+            }
+            if (e.button.button != SDL_BUTTON_LEFT) break;
             if (!gPtr.down) {
                 gPtr.finger = false;
                 pointerDown(e.button.x * gMouseSX, e.button.y * gMouseSY);
@@ -5157,10 +7076,23 @@ static void handleEvent(const SDL_Event &e) {
             break;
         case SDL_MOUSEMOTION:
             if (e.motion.which == SDL_TOUCH_MOUSEID) break;
+            if (gArrowDrag && !gPtr.down) {
+                gPtr.x = e.motion.x * gMouseSX;
+                gPtr.y = e.motion.y * gMouseSY;
+                break;
+            }
             if (!gPtr.finger || !gPtr.down) pointerMove(e.motion.x * gMouseSX, e.motion.y * gMouseSY);
             break;
         case SDL_MOUSEBUTTONUP:
-            if (e.button.which == SDL_TOUCH_MOUSEID || e.button.button != SDL_BUTTON_LEFT) break;
+            if (e.button.which == SDL_TOUCH_MOUSEID) break;
+            if (e.button.button == SDL_BUTTON_RIGHT && gArrowDrag) {
+                gArrowDrag = false;
+                int to = xyToSq(gameLayout(), e.button.x * gMouseSX, e.button.y * gMouseSY);
+                if (to >= 0 && to != gArrowFrom) toggleArrow(gArrowFrom, to);
+                else if (to >= 0) toggleCircle(to);
+                break;
+            }
+            if (e.button.button != SDL_BUTTON_LEFT) break;
             if (gPtr.down && !gPtr.finger) pointerUp(e.button.x * gMouseSX, e.button.y * gMouseSY);
             break;
         case SDL_MOUSEWHEEL:
@@ -5173,6 +7105,7 @@ static void handleEvent(const SDL_Event &e) {
 
 static void update() {
     netPoll();
+    pollReview();
     Uint32 now = SDL_GetTicks();
     Uint32 dt = now - gLastTick;
     gLastTick = now;
@@ -5214,13 +7147,22 @@ static void update() {
         }
     }
     if (gScreen == SC_LESSON && gLResetAt && now >= gLResetAt) loadLessonPage(false);
+    if (gScreen == SC_LESSON && gLReplyAt && now >= gLReplyAt) lessonReply();
+    if (gScreen == SC_LESSON && gLGAuto && now >= gLGNext) {
+        if (gLGPly < (int)gLGMoves.size()) {
+            lessonGameShow(gLGPly + 1);
+            playSound(gLB.inCheck(gLB.side) ? SND_CHECK : SND_MOVE);
+            gLGNext = now + 1500;
+        }
+        if (gLGPly >= (int)gLGMoves.size()) gLGAuto = false;
+    }
     buildScreenButtons();
     buildOverlayButtons();
 }
 
 static bool needsAnimation() {
-    if (gPtr.down || !gAnims.empty() || botThinking() || gResultPending || gLResetAt) return true;
-    if (gScreen == SC_NET || SDL_GetTicks() < gToastUntil) return true;
+    if (gPtr.down || gArrowDrag || !gAnims.empty() || botThinking() || gResultPending || gLResetAt || gLReplyAt || gLGAuto) return true;
+    if (gScreen == SC_NET || SDL_GetTicks() < gToastUntil || gRvThread) return true;
     if (gScreen == SC_GAME && gM.clockInit > 0 && gM.g.result == RES_NONE && !gM.g.moves.empty()) return true;
     return false;
 }
@@ -5360,6 +7302,7 @@ static bool appInit() {
     updateSize();
     fontInit();
     geoInit();
+    vpiecesInit();
     eng::ttInit(19);
     initSavePath();
     loadAll();
@@ -5409,6 +7352,7 @@ static void appFrame() {
 
 static void appQuit() {
     cancelBot();
+    cancelReview();
     if (gM.mode == MODE_NET) netLeave(true);
     netCloseAll();
     saveAll();
