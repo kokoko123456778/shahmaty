@@ -23,6 +23,54 @@
 #define SHAH_HAVE_FSYNC 1
 #endif
 
+// Сеть: системные сокеты ОС (не отдельная библиотека). На Android нужно
+// разрешение android.permission.INTERNET в манифесте приложения.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+typedef SOCKET sock_t;
+#define SOCK_BAD INVALID_SOCKET
+static bool sockWouldBlock() {
+    int e = WSAGetLastError();
+    return e == WSAEWOULDBLOCK || e == WSAEINPROGRESS || e == WSAEALREADY;
+}
+static void sockClose(sock_t s) { closesocket(s); }
+static void sockNonBlock(sock_t s) {
+    u_long m = 1;
+    ioctlsocket(s, FIONBIO, &m);
+}
+#else
+#include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+typedef int sock_t;
+#define SOCK_BAD (-1)
+static bool sockWouldBlock() { return errno == EWOULDBLOCK || errno == EAGAIN || errno == EINPROGRESS || errno == EINTR; }
+static void sockClose(sock_t s) { close(s); }
+static void sockNonBlock(sock_t s) {
+    int f = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, f | O_NONBLOCK);
+}
+#endif
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 // =====================================================================
 //                             ДВИЖОК
 // =====================================================================
@@ -1079,7 +1127,7 @@ static Move think(const Board &rb, const std::vector<uint64_t> &hist, int level,
 //                           ПАРТИЯ
 // =====================================================================
 enum { RES_NONE = 0, RES_WHITE = 1, RES_BLACK = 2, RES_DRAW = 3 };
-enum { R_NONE = 0, R_MATE, R_STALEMATE, R_RESIGN, R_TIME, R_FIFTY, R_REPEAT, R_MATERIAL };
+enum { R_NONE = 0, R_MATE, R_STALEMATE, R_RESIGN, R_TIME, R_FIFTY, R_REPEAT, R_MATERIAL, R_AGREE, R_LEFT };
 
 struct Game {
     eng::Board cur;
@@ -1461,6 +1509,7 @@ static const GlyphDef GLYPHS[] = {
     {'=', {".....", ".....", "####.", ".....", "####.", ".....", "....."}},
     {'.', {".....", ".....", ".....", ".....", ".....", "##...", "##..."}},
     {',', {".....", ".....", ".....", ".....", "##...", ".#...", "#...."}},
+    {';', {".....", "##...", "##...", ".....", "##...", ".#...", "#...."}},
     {':', {".....", "##...", "##...", ".....", "##...", "##...", "....."}},
     {'!', {"#....", "#....", "#....", "#....", "#....", ".....", "#...."}},
     {'?', {".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."}},
@@ -1515,6 +1564,7 @@ static const Glyph *glyphFor(uint32_t cp) {
     if (cp == 0x451) cp = 0x401;
     if (cp >= 0x430 && cp < 0x450 && !gCyr[cp - 0x400].ok) cp -= 0x20;
     if (cp >= 0x400 && cp < 0x460 && gCyr[cp - 0x400].ok) return &gCyr[cp - 0x400];
+    if (cp == 0x2013 || cp == 0x2014) return &gAscii[(int)'-'];
     if (cp == 0xB7) return &gMisc[0];
     if (cp == 0x2026) return &gMisc[1];
     return &gAscii[(int)'?'];
@@ -1915,10 +1965,10 @@ static void playSound(int k) {
 // =====================================================================
 //                        СОСТОЯНИЕ ИГРЫ
 // =====================================================================
-enum { SC_MENU, SC_SETUP, SC_GAME, SC_STATS };
+enum { SC_MENU, SC_SETUP, SC_GAME, SC_STATS, SC_LEARN, SC_LESSON, SC_NET };
 enum { OV_NONE, OV_PROMO, OV_CONFIRM, OV_RESULT };
-enum { CF_NONE, CF_RESIGN, CF_NEW, CF_RESET };
-enum { MODE_BOT = 0, MODE_TWO = 1 };
+enum { CF_NONE, CF_RESIGN, CF_NEW, CF_RESET, CF_NET_DRAW, CF_NET_NEW, CF_NET_LEAVE, CF_NET_LOST };
+enum { MODE_BOT = 0, MODE_TWO = 1, MODE_NET = 2 };
 
 struct Settings {
     int level = 2;
@@ -1927,6 +1977,7 @@ struct Settings {
 };
 struct Stats {
     int wins = 0, losses = 0, draws = 0, two = 0;
+    int netW = 0, netL = 0, netD = 0;
 };
 struct Match {
     bool active = false;
@@ -1971,6 +2022,7 @@ static const Uint32 ANIM_MS = 170;
 static bool gResultPending = false;
 static Uint32 gResultAt = 0;
 static int gListScroll = 0;
+static int gSolved[16] = {0};  // решённые задачи по темам (биты = страницы)
 
 struct Pointer {
     bool down = false;
@@ -1981,6 +2033,329 @@ struct Pointer {
     int listStart = 0;
     bool outside = false;
 } gPtr;
+
+// ------------------------- сеть: соединение -------------------------
+// Игра по локальной сети (один Wi-Fi или точка доступа): один телефон создаёт
+// игру (TCP-сервер + рассылка о себе по UDP), второй находит её или вводит адрес.
+enum { NS_IDLE, NS_HOSTING, NS_CONNECTING, NS_CONNECTED };
+static const int NET_TCP_PORT = 47474, NET_UDP_PORT = 47475;
+struct NetState {
+    int state = NS_IDLE;
+    bool isHost = false;
+    sock_t lsock = SOCK_BAD, sock = SOCK_BAD, udp = SOCK_BAD, scan = SOCK_BAD;
+    std::string in, out;
+    Uint32 lastRecv = 0, lastSend = 0, lastBcast = 0, connStart = 0;
+    std::string myIp, peerIp;
+    bool lost = false;
+};
+static NetState gNet;
+struct FoundGame {
+    std::string ip;
+    int color, clockMin;
+    Uint32 seen;
+};
+static std::vector<FoundGame> gFound;
+static Match gBackup;  // офлайн-партия, отложенная на время сетевой игры
+static bool gHaveBackup = false;
+static std::string gNetLastIp;
+static std::string gToast;
+static Uint32 gToastUntil = 0;
+static void toast(const std::string &s) {
+    gToast = s;
+    gToastUntil = SDL_GetTicks() + 2800;
+}
+
+static bool netStartup() {
+#if defined(_WIN32)
+    static bool ok = false;
+    if (!ok) {
+        WSADATA w;
+        ok = WSAStartup(MAKEWORD(2, 2), &w) == 0;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+static void closeSock(sock_t &s) {
+    if (s != SOCK_BAD) {
+        sockClose(s);
+        s = SOCK_BAD;
+    }
+}
+static void netNoDelay(sock_t s) {
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+}
+
+static void netFlush() {
+    if (gNet.sock == SOCK_BAD || gNet.state != NS_CONNECTED) return;
+    while (!gNet.out.empty()) {
+        int n = (int)send(gNet.sock, gNet.out.data(), (int)gNet.out.size(), MSG_NOSIGNAL);
+        if (n > 0) {
+            gNet.out.erase(0, (size_t)n);
+            gNet.lastSend = SDL_GetTicks();
+        } else {
+            if (n < 0 && !sockWouldBlock()) gNet.lost = true;
+            break;
+        }
+    }
+}
+static bool netConnected() { return gNet.state == NS_CONNECTED && !gNet.lost; }
+static void netSendLine(const std::string &l) {
+    if (gNet.state != NS_CONNECTED) return;
+    gNet.out += l;
+    gNet.out += "\n";
+    netFlush();
+}
+static void netCloseAll() {
+    closeSock(gNet.lsock);
+    closeSock(gNet.sock);
+    closeSock(gNet.udp);
+    closeSock(gNet.scan);
+    gNet.state = NS_IDLE;
+    gNet.in.clear();
+    gNet.out.clear();
+    gNet.lost = false;
+    gFound.clear();
+}
+
+// Свой адрес в сети: «подключаем» UDP-сокет к внешнему адресу (пакеты не уходят)
+static std::string netLocalIp() {
+    if (!netStartup()) return "";
+    const char *probes[] = {"8.8.8.8", "192.168.1.1", "192.168.0.1", "192.168.43.1", "10.0.0.1", "172.16.0.1"};
+    for (const char *pr : probes) {
+        sock_t s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s == SOCK_BAD) continue;
+        sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons(53);
+        inet_pton(AF_INET, pr, &a.sin_addr);
+        std::string r;
+        if (connect(s, (sockaddr *)&a, sizeof a) == 0) {
+            sockaddr_in me;
+            memset(&me, 0, sizeof me);
+            socklen_t len = sizeof me;
+            if (getsockname(s, (sockaddr *)&me, &len) == 0) {
+                char buf[64] = {0};
+                inet_ntop(AF_INET, &me.sin_addr, buf, sizeof buf);
+                r = buf;
+            }
+        }
+        sockClose(s);
+        if (!r.empty() && r != "0.0.0.0" && r.compare(0, 4, "127.") != 0) return r;
+    }
+    return "";
+}
+
+static bool netHost() {
+    netCloseAll();
+    if (!netStartup()) return false;
+    sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == SOCK_BAD) return false;
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+    sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons(NET_TCP_PORT);
+    if (bind(s, (sockaddr *)&a, sizeof a) != 0 || listen(s, 2) != 0) {
+        sockClose(s);
+        return false;
+    }
+    sockNonBlock(s);
+    gNet.lsock = s;
+    sock_t u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u != SOCK_BAD) {
+        setsockopt(u, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
+        sockNonBlock(u);
+        gNet.udp = u;
+    }
+    gNet.state = NS_HOSTING;
+    gNet.isHost = true;
+    gNet.myIp = netLocalIp();
+    gNet.lastBcast = 0;
+    return true;
+}
+
+static void netScanStart() {
+    closeSock(gNet.scan);
+    gFound.clear();
+    if (!netStartup()) return;
+    sock_t u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u == SOCK_BAD) return;
+    int one = 1;
+    setsockopt(u, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+    setsockopt(u, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
+    sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons(NET_UDP_PORT);
+    if (bind(u, (sockaddr *)&a, sizeof a) != 0) {
+        sockClose(u);
+        return;
+    }
+    sockNonBlock(u);
+    gNet.scan = u;
+}
+
+static bool validIp(const std::string &ip) {
+    in_addr a;
+    return inet_pton(AF_INET, ip.c_str(), &a) == 1;
+}
+
+static bool netConnect(const std::string &ip) {
+    netCloseAll();
+    if (!netStartup() || !validIp(ip)) return false;
+    sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == SOCK_BAD) return false;
+    sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(NET_TCP_PORT);
+    inet_pton(AF_INET, ip.c_str(), &a.sin_addr);
+    sockNonBlock(s);
+    int r = connect(s, (sockaddr *)&a, sizeof a);
+    if (r != 0 && !sockWouldBlock()) {
+        sockClose(s);
+        return false;
+    }
+    gNet.sock = s;
+    gNet.state = NS_CONNECTING;
+    gNet.connStart = SDL_GetTicks();
+    gNet.peerIp = ip;
+    gNet.isHost = false;
+    return true;
+}
+
+static void netHandleLine(const std::string &l);  // протокол — ниже
+
+static void netPollIO() {
+    Uint32 now = SDL_GetTicks();
+    // поиск игр: слушаем рассылку
+    if (gNet.scan != SOCK_BAD) {
+        char buf[256];
+        for (;;) {
+            sockaddr_in from;
+            memset(&from, 0, sizeof from);
+            socklen_t fl = sizeof from;
+            int n = (int)recvfrom(gNet.scan, buf, sizeof buf - 1, 0, (sockaddr *)&from, &fl);
+            if (n <= 0) break;
+            buf[n] = 0;
+            int port = 0, col = 0, clk = 0;
+            if (sscanf(buf, "SHAHMATY_HOST %d %d %d", &port, &col, &clk) == 3 && port == NET_TCP_PORT) {
+                char ip[64] = {0};
+                inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
+                bool found = false;
+                for (auto &f : gFound)
+                    if (f.ip == ip) { f.seen = now; f.color = col; f.clockMin = clk; found = true; }
+                if (!found && gFound.size() < 6) {
+                    FoundGame g;
+                    g.ip = ip; g.color = col; g.clockMin = clk; g.seen = now;
+                    gFound.push_back(g);
+                }
+            }
+        }
+        for (size_t i = 0; i < gFound.size();)
+            if (now - gFound[i].seen > 4500) gFound.erase(gFound.begin() + (long)i);
+            else i++;
+    }
+    if (gNet.state == NS_HOSTING) {
+        if (gNet.udp != SOCK_BAD && now - gNet.lastBcast > 1000) {
+            gNet.lastBcast = now;
+            static const int MIN[4] = {0, 5, 10, 15};
+            char msg[96];
+            snprintf(msg, sizeof msg, "SHAHMATY_HOST %d %d %d", NET_TCP_PORT, gSet.color, MIN[gSet.clock]);
+            sockaddr_in a;
+            memset(&a, 0, sizeof a);
+            a.sin_family = AF_INET;
+            a.sin_port = htons(NET_UDP_PORT);
+            a.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+            sendto(gNet.udp, msg, (int)strlen(msg), 0, (sockaddr *)&a, sizeof a);
+            if (gNet.myIp.empty()) gNet.myIp = netLocalIp();
+            size_t dot = gNet.myIp.rfind('.');
+            if (dot != std::string::npos) {
+                std::string bc = gNet.myIp.substr(0, dot) + ".255";
+                if (inet_pton(AF_INET, bc.c_str(), &a.sin_addr) == 1)
+                    sendto(gNet.udp, msg, (int)strlen(msg), 0, (sockaddr *)&a, sizeof a);
+            }
+        }
+        sockaddr_in pa;
+        memset(&pa, 0, sizeof pa);
+        socklen_t pl = sizeof pa;
+        sock_t c = accept(gNet.lsock, (sockaddr *)&pa, &pl);
+        if (c != SOCK_BAD) {
+            sockNonBlock(c);
+            netNoDelay(c);
+            char ip[64] = {0};
+            inet_ntop(AF_INET, &pa.sin_addr, ip, sizeof ip);
+            gNet.peerIp = ip;
+            gNet.sock = c;
+            closeSock(gNet.lsock);
+            closeSock(gNet.udp);
+            gNet.state = NS_CONNECTED;
+            gNet.lastRecv = gNet.lastSend = now;
+        }
+    }
+    if (gNet.state == NS_CONNECTING) {
+        fd_set w;
+        FD_ZERO(&w);
+        FD_SET(gNet.sock, &w);
+        timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        int r = select((int)gNet.sock + 1, nullptr, &w, nullptr, &tv);
+        bool fail = false;
+        if (r > 0) {
+            int err = 0;
+            socklen_t el = sizeof err;
+            getsockopt(gNet.sock, SOL_SOCKET, SO_ERROR, (char *)&err, &el);
+            if (err == 0) {
+                gNet.state = NS_CONNECTED;
+                gNet.lastRecv = gNet.lastSend = now;
+                netNoDelay(gNet.sock);
+                netSendLine("HELLO SHAHMATY 1");
+            } else {
+                fail = true;
+            }
+        } else if (r < 0 || now - gNet.connStart > 6000) {
+            fail = true;
+        }
+        if (fail) netCloseAll();
+    }
+    if (gNet.state == NS_CONNECTED && !gNet.lost) {
+        netFlush();
+        char buf[2048];
+        for (;;) {
+            int n = (int)recv(gNet.sock, buf, sizeof buf, 0);
+            if (n > 0) {
+                gNet.in.append(buf, (size_t)n);
+                gNet.lastRecv = now;
+                if (gNet.in.size() > 65536) { gNet.lost = true; break; }
+            } else if (n == 0) {
+                gNet.lost = true;
+                break;
+            } else {
+                if (!sockWouldBlock()) gNet.lost = true;
+                break;
+            }
+        }
+        size_t p;
+        while (gNet.state == NS_CONNECTED && (p = gNet.in.find('\n')) != std::string::npos) {
+            std::string line = gNet.in.substr(0, p);
+            gNet.in.erase(0, p + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            netHandleLine(line);
+        }
+        if (gNet.state == NS_CONNECTED) {
+            if (now - gNet.lastSend > 2000) netSendLine("PING");
+            if (now - gNet.lastRecv > 45000) gNet.lost = true;
+        }
+    }
+}
 
 // ------------------------- сохранение -------------------------
 static void initSavePath() {
@@ -2003,16 +2378,23 @@ static void saveAll() {
     std::string s;
     char buf[256];
     s += "SHAHMATY 1\n";
-    snprintf(buf, sizeof buf, "STATS %d %d %d %d\n", gStats.wins, gStats.losses, gStats.draws, gStats.two);
+    // во время сетевой игры сохраняем отложенную офлайн-партию
+    const Match &mm = gM.mode == MODE_NET ? gBackup : gM;
+    snprintf(buf, sizeof buf, "STATS %d %d %d %d %d %d %d\n", gStats.wins, gStats.losses, gStats.draws, gStats.two,
+             gStats.netW, gStats.netL, gStats.netD);
     s += buf;
     snprintf(buf, sizeof buf, "SET %d %d %d %d\n", gSet.level, gSet.color, gSet.clock, gSoundOn);
     s += buf;
-    snprintf(buf, sizeof buf, "MATCH %d %d %d %d %d %lld %lld %d %d %d %d %d\n", gM.active ? 1 : 0, gM.mode, gM.human,
-             gM.level, gM.clockInit, gM.tLeft[0], gM.tLeft[1], gM.flip ? 1 : 0, gM.recorded ? 1 : 0, gM.g.result,
-             gM.g.reason, gM.g.loser);
+    s += "LEARN";
+    for (int i = 0; i < 16; i++) s += " " + std::to_string(gSolved[i]);
+    s += "\n";
+    if (!gNetLastIp.empty() && validIp(gNetLastIp)) s += "NETIP " + gNetLastIp + "\n";
+    snprintf(buf, sizeof buf, "MATCH %d %d %d %d %d %lld %lld %d %d %d %d %d\n", mm.active ? 1 : 0, mm.mode, mm.human,
+             mm.level, mm.clockInit, mm.tLeft[0], mm.tLeft[1], mm.flip ? 1 : 0, mm.recorded ? 1 : 0, mm.g.result,
+             mm.g.reason, mm.g.loser);
     s += buf;
     s += "MOVES";
-    for (auto m : gM.g.moves) s += " " + eng::toUCI(m);
+    for (auto m : mm.g.moves) s += " " + eng::toUCI(m);
     s += "\nEND\n";
     std::string tmp = gSavePath + ".tmp";
     FILE *f = fopen(tmp.c_str(), "wb");
@@ -2056,7 +2438,11 @@ static void loadAll() {
         pos = e + 1;
         if (line.compare(0, 6, "STATS ") == 0) {
             Stats st;
-            if (sscanf(line.c_str() + 6, "%d %d %d %d", &st.wins, &st.losses, &st.draws, &st.two) == 4) gStats = st;
+            if (sscanf(line.c_str() + 6, "%d %d %d %d %d %d %d", &st.wins, &st.losses, &st.draws, &st.two, &st.netW,
+                       &st.netL, &st.netD) >= 4)
+                gStats = st;
+        } else if (line.compare(0, 6, "NETIP ") == 0) {
+            if (validIp(line.substr(6))) gNetLastIp = line.substr(6);
         } else if (line.compare(0, 4, "SET ") == 0) {
             int a, b, c, d;
             if (sscanf(line.c_str() + 4, "%d %d %d %d", &a, &b, &c, &d) == 4) {
@@ -2069,6 +2455,15 @@ static void loadAll() {
             if (sscanf(line.c_str() + 6, "%d %d %d %d %d %lld %lld %d %d %d %d %d", &mActive, &mMode, &mHuman, &mLevel,
                        &mClock, &t0, &t1, &mFlip, &mRec, &mRes, &mReason, &mLoser) >= 11)
                 haveMatch = true;
+        } else if (line.compare(0, 6, "LEARN ") == 0) {
+            const char *q = line.c_str() + 6;
+            for (int k = 0; k < 16 && *q; k++) {
+                char *end = nullptr;
+                long v = strtol(q, &end, 10);
+                if (end == q) break;
+                gSolved[k] = (int)v;
+                q = end;
+            }
         } else if (line.compare(0, 5, "MOVES") == 0) {
             movesLine = line.substr(5);
         }
@@ -2206,6 +2601,10 @@ static void recordResult() {
         if (gM.g.result == RES_DRAW) gStats.draws++;
         else if ((gM.g.result == RES_WHITE) == (gM.human == eng::WHITE)) gStats.wins++;
         else gStats.losses++;
+    } else if (gM.mode == MODE_NET) {
+        if (gM.g.result == RES_DRAW) gStats.netD++;
+        else if ((gM.g.result == RES_WHITE) == (gM.human == eng::WHITE)) gStats.netW++;
+        else gStats.netL++;
     } else {
         gStats.two++;
     }
@@ -2227,7 +2626,11 @@ static void playMove(eng::Move m, bool animate) {
     bool cap = (eng::mFlags(m) & eng::F_CAP) != 0;
     bool castle = (eng::mFlags(m) & eng::F_CASTLE) != 0;
     int piece = b.sq[from];
+    int mover = b.side;
     gM.g.play(m);
+    if (gM.mode == MODE_NET && mover == gM.human)
+        netSendLine("MOVE " + std::to_string(gM.g.moves.size() - 1) + " " + eng::toUCI(m) + " " +
+                    std::to_string(gM.tLeft[mover]));
     gAnims.clear();
     if (animate) {
         Anim a;
@@ -2309,7 +2712,7 @@ static void restartSame() {
 }
 
 static void doUndo() {
-    if (!gM.active) return;
+    if (!gM.active || gM.mode == MODE_NET) return;
     if (gM.mode == MODE_BOT) {
         if (gM.g.result != RES_NONE) return;
         if (botThinking()) {
@@ -2333,7 +2736,7 @@ static void doUndo() {
 }
 
 static bool canUndo() {
-    if (!gM.active || gM.g.moves.empty()) return false;
+    if (!gM.active || gM.g.moves.empty() || gM.mode == MODE_NET) return false;
     if (gM.mode == MODE_BOT) {
         if (gM.g.result != RES_NONE) return false;
         if (botThinking()) return true;
@@ -2348,7 +2751,8 @@ static bool canUndo() {
 
 static void doResign() {
     if (!gM.active || gM.g.result != RES_NONE) return;
-    int loser = gM.mode == MODE_BOT ? gM.human : gM.g.cur.side;
+    int loser = gM.mode != MODE_TWO ? gM.human : gM.g.cur.side;
+    if (gM.mode == MODE_NET) netSendLine("RESIGN");
     gM.g.result = loser == eng::WHITE ? RES_BLACK : RES_WHITE;
     gM.g.reason = R_RESIGN;
     gM.g.loser = loser;
@@ -2368,8 +2772,586 @@ static void onTimeout(int side) {
 static bool canHumanMove() {
     if (gScreen != SC_GAME || !gM.active || gM.g.result != RES_NONE || gOverlay != OV_NONE) return false;
     if (gM.mode == MODE_BOT) return !botThinking() && gM.g.cur.side == gM.human;
+    if (gM.mode == MODE_NET) return netConnected() && gM.g.cur.side == gM.human;
     return true;
 }
+
+// =====================================================================
+//                     ОБУЧЕНИЕ: УРОКИ И ЗАДАЧИ
+// =====================================================================
+// Режимы страницы: показ позиции, «попробуй походить» фигурой, задача.
+enum { LM_SHOW = 0, LM_MOVES = 1, LM_PUZZLE = 2 };
+struct LPage {
+    const char *title;
+    const char *fen;
+    const char *marks;  // «e4:g» — подсветка (g/r/y/b), «c4>f7» — стрелка
+    int mode;
+    const char *sol;    // LM_MOVES: поле фигуры; LM_PUZZLE: ход «e4f6» или «#» (любой мат)
+    const char *text;
+};
+struct LChapter {
+    const char *title;
+    const char *sub;
+    const LPage *pages;
+    int n;
+};
+
+#define FEN_START "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+#define FEN_ITALIAN "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+
+static const LPage LP_BASICS[] = {
+    {"ШАХМАТНАЯ ДОСКА", FEN_START, "h1:g a1:y", LM_SHOW, "",
+     "ДОСКА СОСТОИТ ИЗ 64 КЛЕТОК. ВЕРТИКАЛИ ОБОЗНАЧАЮТ БУКВАМИ ОТ a ДО h, ГОРИЗОНТАЛИ - ЦИФРАМИ ОТ 1 ДО 8. "
+     "У КАЖДОЙ КЛЕТКИ ЕСТЬ ИМЯ, НАПРИМЕР e4.\n"
+     "ДОСКУ КЛАДУТ ТАК, ЧТОБЫ СПРАВА ВНИЗУ У ИГРОКА БЫЛА СВЕТЛАЯ КЛЕТКА h1."},
+    {"РАССТАНОВКА", FEN_START, "d1:g d8:g e1:y e8:y", LM_SHOW, "",
+     "ЛАДЬИ СТОЯТ В УГЛАХ, РЯДОМ С НИМИ КОНИ, ЗАТЕМ СЛОНЫ. ФЕРЗЬ ЗАНИМАЕТ ПОЛЕ СВОЕГО ЦВЕТА: "
+     "БЕЛЫЙ - d1, ЧЁРНЫЙ - d8. КОРОЛИ СТОЯТ НА e1 И e8. ВПЕРЕДИ - ВОСЕМЬ ПЕШЕК.\n"
+     "ПЕРВЫЙ ХОД ДЕЛАЮТ БЕЛЫЕ, ДАЛЬШЕ ИГРОКИ ХОДЯТ ПО ОЧЕРЕДИ. ПРОПУСТИТЬ ХОД НЕЛЬЗЯ."},
+    {"ЦЕЛЬ ИГРЫ", "3R2k1/5ppp/8/8/8/8/5PPP/6K1 b - - 0 1", "g8:r d8>g8", LM_SHOW, "",
+     "ЦЕЛЬ ШАХМАТ - ПОСТАВИТЬ МАТ КОРОЛЮ СОПЕРНИКА: НАПАСТЬ НА НЕГО ТАК, ЧТОБЫ ОН НЕ СМОГ СПАСТИСЬ. "
+     "КОРОЛЯ НЕ СЪЕДАЮТ - ПАРТИЯ ЗАКАНЧИВАЕТСЯ В МОМЕНТ МАТА.\n"
+     "НА ДИАГРАММЕ БЕЛАЯ ЛАДЬЯ ПОСТАВИЛА МАТ: ЧЁРНОМУ КОРОЛЮ НЕКУДА УЙТИ."},
+};
+
+static const LPage LP_PIECES[] = {
+    {"ПЕШКА", "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1", "", LM_MOVES, "e2",
+     "ПЕШКА ХОДИТ ТОЛЬКО ВПЕРЁД НА ОДНУ КЛЕТКУ. СО СВОЕГО НАЧАЛЬНОГО ПОЛЯ ОНА МОЖЕТ ПРОЙТИ СРАЗУ НА ДВЕ. "
+     "НАЗАД ПЕШКИ НЕ ХОДЯТ.\nНАЖИМАЙТЕ НА ТОЧКИ, ЧТОБЫ ПОХОДИТЬ."},
+    {"ПЕШКА БЬЁТ", "4k3/8/8/3p1n2/4P3/8/8/4K3 w - - 0 1", "", LM_MOVES, "e4",
+     "ПЕШКА БЬЁТ НЕ ТАК, КАК ХОДИТ: НАИСКОСОК НА ОДНУ КЛЕТКУ ВПЕРЁД. ЗДЕСЬ ПЕШКА e4 МОЖЕТ ВЗЯТЬ ПЕШКУ d5 "
+     "ИЛИ КОНЯ f5. ФИГУРУ ПРЯМО ПЕРЕД СОБОЙ ПЕШКА ВЗЯТЬ НЕ МОЖЕТ."},
+    {"КОНЬ", "4k3/8/8/8/3N4/8/8/4K3 w - - 0 1", "", LM_MOVES, "d4",
+     "КОНЬ ХОДИТ БУКВОЙ Г: ДВЕ КЛЕТКИ ПО ПРЯМОЙ И ОДНА В СТОРОНУ. ЭТО ЕДИНСТВЕННАЯ ФИГУРА, КОТОРАЯ "
+     "ПЕРЕПРЫГИВАЕТ ЧЕРЕЗ ДРУГИЕ.\nВ ЦЕНТРЕ КОНЬ АТАКУЕТ 8 ПОЛЕЙ, А В УГЛУ - ВСЕГО 2. ПОЭТОМУ ГОВОРЯТ: "
+     "КОНЬ НА КРАЮ - ДОСКЕ ГОРЕ."},
+    {"СЛОН", "4k3/8/8/8/3B4/8/8/4K3 w - - 0 1", "", LM_MOVES, "d4",
+     "СЛОН ХОДИТ ПО ДИАГОНАЛИ НА ЛЮБОЕ РАССТОЯНИЕ, НО НЕ ПЕРЕПРЫГИВАЕТ ФИГУРЫ. ВСЮ ПАРТИЮ СЛОН ОСТАЁТСЯ "
+     "НА ПОЛЯХ ОДНОГО ЦВЕТА, ПОЭТОМУ У КАЖДОГО ИГРОКА ЕСТЬ БЕЛОПОЛЬНЫЙ И ЧЕРНОПОЛЬНЫЙ СЛОН."},
+    {"ЛАДЬЯ", "4k3/8/8/8/3R4/8/8/4K3 w - - 0 1", "", LM_MOVES, "d4",
+     "ЛАДЬЯ ХОДИТ ПО ВЕРТИКАЛИ И ГОРИЗОНТАЛИ НА ЛЮБОЕ РАССТОЯНИЕ. ОНА ОСОБЕННО СИЛЬНА НА ОТКРЫТЫХ "
+     "ЛИНИЯХ, ГДЕ НЕТ ПЕШЕК, И НА ПРЕДПОСЛЕДНЕЙ ГОРИЗОНТАЛИ СОПЕРНИКА."},
+    {"ФЕРЗЬ", "4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1", "", LM_MOVES, "d4",
+     "ФЕРЗЬ - САМАЯ СИЛЬНАЯ ФИГУРА: ОН ХОДИТ И КАК ЛАДЬЯ, И КАК СЛОН. НО НЕ СПЕШИТЕ ВЫВОДИТЬ ЕГО В "
+     "НАЧАЛЕ ПАРТИИ: СОПЕРНИК БУДЕТ НАПАДАТЬ НА ФЕРЗЯ ЛЁГКИМИ ФИГУРАМИ И ВЫИГРЫВАТЬ ВРЕМЯ."},
+    {"КОРОЛЬ", "8/8/8/8/3K4/8/8/7k w - - 0 1", "", LM_MOVES, "d4",
+     "КОРОЛЬ ХОДИТ НА ОДНУ КЛЕТКУ В ЛЮБУЮ СТОРОНУ. СТАВИТЬ КОРОЛЯ ПОД УДАР НЕЛЬЗЯ, ПОЭТОМУ ДВА КОРОЛЯ "
+     "НИКОГДА НЕ СТОЯТ РЯДОМ. БЕРЕГИТЕ КОРОЛЯ: МАТ ЕМУ - ЭТО ПРОИГРЫШ."},
+};
+
+static const LPage LP_SPECIAL[] = {
+    {"РОКИРОВКА", "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1", "", LM_MOVES, "e1",
+     "РОКИРОВКА - ХОД КОРОЛЁМ И ЛАДЬЁЙ СРАЗУ. КОРОЛЬ ИДЁТ НА ДВЕ КЛЕТКИ К ЛАДЬЕ, А ЛАДЬЯ ПЕРЕПРЫГИВАЕТ "
+     "ЧЕРЕЗ НЕГО. КОРОЛЬ ПРЯЧЕТСЯ, А ЛАДЬЯ ВСТУПАЕТ В ИГРУ.\n"
+     "УСЛОВИЯ: КОРОЛЬ И ЛАДЬЯ ЕЩЁ НЕ ХОДИЛИ, МЕЖДУ НИМИ ПУСТО, КОРОЛЬ НЕ ПОД ШАХОМ И НЕ ПРОХОДИТ ЧЕРЕЗ "
+     "АТАКОВАННОЕ ПОЛЕ.\nВ ИГРЕ ПРОСТО ПЕРЕДВИНЬТЕ КОРОЛЯ НА ДВЕ КЛЕТКИ."},
+    {"ВЗЯТИЕ НА ПРОХОДЕ", "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", "d7>d5", LM_MOVES, "e5",
+     "ЕСЛИ ПЕШКА СОПЕРНИКА СДЕЛАЛА ДВОЙНОЙ ШАГ И ВСТАЛА РЯДОМ С ВАШЕЙ ПЕШКОЙ, ЕЁ МОЖНО ВЗЯТЬ ТАК, БУДТО "
+     "ОНА ПРОШЛА ОДНУ КЛЕТКУ. ЗДЕСЬ ЧЁРНЫЕ СЫГРАЛИ d7-d5, И БЕЛЫЕ МОГУТ БИТЬ exd6.\n"
+     "ТАК БРАТЬ МОЖНО ТОЛЬКО СРАЗУ, СЛЕДУЮЩИМ ХОДОМ."},
+    {"ПРЕВРАЩЕНИЕ ПЕШКИ", "8/4P3/8/8/8/k7/8/4K3 w - - 0 1", "", LM_MOVES, "e7",
+     "ПЕШКА, ДОШЕДШАЯ ДО ПОСЛЕДНЕЙ ГОРИЗОНТАЛИ, ПРЕВРАЩАЕТСЯ В ЛЮБУЮ ФИГУРУ, КРОМЕ КОРОЛЯ. ЧАЩЕ ВСЕГО "
+     "ВЫБИРАЮТ ФЕРЗЯ. ПОЭТОМУ ПРОХОДНАЯ ПЕШКА, КОТОРУЮ НЕ МОГУТ ОСТАНОВИТЬ ПЕШКИ СОПЕРНИКА, ОЧЕНЬ ОПАСНА."},
+};
+
+static const LPage LP_ENDING[] = {
+    {"ШАХ", "4k3/8/8/8/8/8/8/4R1K1 b - - 0 1", "e1>e8", LM_SHOW, "",
+     "ШАХ - ЭТО НАПАДЕНИЕ НА КОРОЛЯ. НА ШАХ НУЖНО ОТВЕТИТЬ СРАЗУ ОДНИМ ИЗ ТРЁХ СПОСОБОВ:\n"
+     "1. УЙТИ КОРОЛЁМ НА БЕЗОПАСНОЕ ПОЛЕ.\n2. ЗАКРЫТЬСЯ ДРУГОЙ ФИГУРОЙ.\n3. ВЗЯТЬ ФИГУРУ, КОТОРАЯ ДАЁТ ШАХ."},
+    {"МАТ", "3R2k1/5ppp/8/8/8/8/5PPP/6K1 b - - 0 1", "f7:y g7:y h7:y", LM_SHOW, "",
+     "МАТ - ЭТО ШАХ, ОТ КОТОРОГО НЕТ ЗАЩИТЫ. ЗДЕСЬ ЧЁРНОГО КОРОЛЯ ЗАПЕРЛИ ЕГО СОБСТВЕННЫЕ ПЕШКИ. ЭТО МАТ "
+     "ПО ПОСЛЕДНЕЙ ГОРИЗОНТАЛИ - ОДНА ИЗ САМЫХ ЧАСТЫХ ОШИБОК.\n"
+     "СОВЕТ: ЗАРАНЕЕ ОСВОБОДИТЕ КОРОЛЮ ПОЛЕ, ПОДВИНУВ ПЕШКУ h ИЛИ g."},
+    {"ПАТ", "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", "h8:y", LM_SHOW, "",
+     "ПАТ - КОГДА ИГРОКУ НЕКУДА ХОДИТЬ, НО ЕГО КОРОЛЬ НЕ ПОД ШАХОМ. ПАТ - ЭТО НИЧЬЯ! ЗДЕСЬ ЧЁРНЫЕ НЕ МОГУТ "
+     "СДЕЛАТЬ НИ ОДНОГО ХОДА.\nКОГДА У ВАС БОЛЬШОЙ ПЕРЕВЕС, ВСЕГДА ПРОВЕРЯЙТЕ, ЧТО У КОРОЛЯ СОПЕРНИКА "
+     "ОСТАЛСЯ ХОД."},
+    {"ДРУГИЕ НИЧЬИ", "8/8/4k3/8/8/3KB3/8/8 w - - 0 1", "", LM_SHOW, "",
+     "НИЧЬЯ БЫВАЕТ ТАКЖЕ:\n- ПРИ НЕДОСТАТКЕ МАТЕРИАЛА: КОРОЛЬ С ОДНИМ СЛОНОМ ИЛИ КОНЁМ НЕ МОЖЕТ ДАТЬ МАТ;\n"
+     "- ПРИ ТРОЕКРАТНОМ ПОВТОРЕНИИ ОДНОЙ И ТОЙ ЖЕ ПОЗИЦИИ;\n"
+     "- ЕСЛИ 50 ХОДОВ ПОДРЯД НЕ БЫЛО НИ ВЗЯТИЙ, НИ ХОДОВ ПЕШКАМИ."},
+};
+
+static const LPage LP_VALUE[] = {
+    {"ЦЕННОСТЬ ФИГУР", "4k3/8/8/8/1P1N1B1R/3Q4/8/4K3 w - - 0 1", "", LM_SHOW, "",
+     "ПРИМЕРНАЯ ЦЕНА ФИГУР В ПЕШКАХ:\nПЕШКА = 1\nКОНЬ = 3, СЛОН = 3\nЛАДЬЯ = 5\nФЕРЗЬ = 9\n"
+     "КОРОЛЬ БЕСЦЕНЕН.\nПЕРЕД ОБМЕНОМ СЧИТАЙТЕ: ОТДАТЬ КОНЯ ЗА ПЕШКУ ИЛИ ЛАДЬЮ ЗА КОНЯ - НЕВЫГОДНО. "
+     "ДВА СЛОНА ОБЫЧНО СИЛЬНЕЕ СЛОНА И КОНЯ."},
+    {"НЕ ЗЕВАЙТЕ ФИГУРЫ", "4k3/pp3ppp/8/3q4/8/2N5/PP3PPP/4K3 w - - 0 1", "", LM_PUZZLE, "c3d5",
+     "ПЕРЕД КАЖДЫМ ХОДОМ ПРОВЕРЯЙТЕ, НЕТ ЛИ НА ДОСКЕ НЕЗАЩИЩЁННЫХ ФИГУР - СВОИХ И ЧУЖИХ.\n"
+     "ЗАДАЧА: ЧЁРНЫЕ ЗЕВНУЛИ ФЕРЗЯ. ЗАБЕРИТЕ ЕГО."},
+};
+
+static const LPage LP_OPENING[] = {
+    {"ПРИНЦИПЫ ДЕБЮТА", FEN_ITALIAN, "e4:g d4:g e5:g d5:g", LM_SHOW, "",
+     "1. ЗАНИМАЙТЕ ЦЕНТР ПЕШКАМИ: e4 И d4.\n2. БЫСТРО ВЫВОДИТЕ КОНЕЙ И СЛОНОВ.\n"
+     "3. СДЕЛАЙТЕ РОКИРОВКУ, ЧТОБЫ СПРЯТАТЬ КОРОЛЯ.\n4. НЕ ХОДИТЕ ОДНОЙ ФИГУРОЙ ДВАЖДЫ БЕЗ НУЖДЫ.\n"
+     "5. ФЕРЗЯ ВЫВОДИТЕ ПОСЛЕ КОНЕЙ И СЛОНОВ."},
+    {"ИТАЛЬЯНСКАЯ ПАРТИЯ", FEN_ITALIAN, "c4>f7 f3>e5", LM_SHOW, "",
+     "1.e4 e5 2.Кf3 Кc6 3.Сc4\nБЕЛЫЕ ЗАНЯЛИ ЦЕНТР, КОНЬ НАПАДАЕТ НА ПЕШКУ e5, А СЛОН НАЦЕЛЕН НА СЛАБОЕ "
+     "ПОЛЕ f7, КОТОРОЕ ЗАЩИЩАЕТ ТОЛЬКО КОРОЛЬ. ОТЛИЧНЫЙ ДЕБЮТ ДЛЯ НАЧИНАЮЩИХ."},
+    {"ДЕТСКИЙ МАТ", "r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4", "e8:r c4>f7", LM_SHOW, "",
+     "ЛОВУШКА ДЛЯ НОВИЧКОВ: ФЕРЗЬ И СЛОН ВМЕСТЕ БЬЮТ НА f7. МАТ УЖЕ НА 4-М ХОДУ.\n"
+     "ЗАЩИТА: ВОВРЕМЯ ПРИКРОЙТЕ f7, НАПРИМЕР ХОДОМ g6 ИЛИ Фe7, И НАПАДАЙТЕ НА РАНО ВЫШЕДШЕГО ФЕРЗЯ."},
+    {"ЗАДАЧА: ДЕТСКИЙ МАТ", "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4", "", LM_PUZZLE, "#",
+     "ЧЁРНЫЕ ОШИБЛИСЬ, СЫГРАВ Кf6 ВМЕСТО ЗАЩИТЫ. ПОСТАВЬТЕ МАТ В ОДИН ХОД."},
+    {"ЧЕГО ИЗБЕГАТЬ", FEN_START, "", LM_SHOW, "",
+     "- НЕ ДВИГАЙТЕ МНОГО ПЕШЕК НА КРАЯХ ДОСКИ.\n- НЕ ВЫВОДИТЕ ФЕРЗЯ СЛИШКОМ РАНО.\n"
+     "- НЕ ОСТАВЛЯЙТЕ КОРОЛЯ В ЦЕНТРЕ.\n- НЕ ГОНИТЕСЬ ЗА ПЕШКАМИ, ПОКА ФИГУРЫ НЕ ВЫВЕДЕНЫ.\n"
+     "- НЕ ЗАПИРАЙТЕ СВОИХ СЛОНОВ СОБСТВЕННЫМИ ПЕШКАМИ."},
+};
+
+static const LPage LP_TACTICS[] = {
+    {"ВИЛКА", "6k1/3q4/8/8/4N3/8/8/4K3 w - - 0 1", "", LM_PUZZLE, "e4f6",
+     "ВИЛКА - ОДНА ФИГУРА НАПАДАЕТ СРАЗУ НА ДВЕ. СОПЕРНИК СПАСЁТ ТОЛЬКО ОДНУ. КОНЬ - МАСТЕР ВИЛОК.\n"
+     "ЗАДАЧА: НАЙДИТЕ ХОД КОНЁМ С ШАХОМ, ЧТОБЫ ВЫИГРАТЬ ФЕРЗЯ."},
+    {"СВЯЗКА", "4k3/8/4n3/8/8/8/8/4R1K1 w - - 0 1", "e1>e8 e6:r", LM_SHOW, "",
+     "СВЯЗКА: КОНЬ e6 НЕ МОЖЕТ УЙТИ, ПОТОМУ ЧТО ЗА НИМ СТОИТ КОРОЛЬ - ОТКРЫВАТЬ КОРОЛЯ ПОД ШАХ НЕЛЬЗЯ. "
+     "СВЯЗАННАЯ ФИГУРА БЕСПОМОЩНА: ЕЁ МОЖНО АТАКОВАТЬ ЕЩЁ РАЗ, НАПРИМЕР ПЕШКОЙ."},
+    {"ЗАДАЧА: СВЯЗКА", "4k3/8/4n3/8/3P4/8/8/4R1K1 w - - 0 1", "", LM_PUZZLE, "d4d5",
+     "КОНЬ e6 СВЯЗАН ЛАДЬЁЙ. НАПАДИТЕ НА НЕГО ПЕШКОЙ - ОН НЕ СМОЖЕТ УЙТИ."},
+    {"СКВОЗНОЙ УДАР", "8/8/2k4q/8/8/8/8/R5K1 w - - 0 1", "", LM_PUZZLE, "a1a6",
+     "СКВОЗНОЙ УДАР: ШАХ КОРОЛЮ, А ЗА НИМ НА ТОЙ ЖЕ ЛИНИИ СТОИТ ЦЕННАЯ ФИГУРА. КОРОЛЬ УХОДИТ - ФИГУРА "
+     "ГИБНЕТ.\nЗАДАЧА: ВЫИГРАЙТЕ ФЕРЗЯ ЧЁРНЫХ."},
+    {"МАТ НА ПОСЛЕДНЕЙ ГОРИЗОНТАЛИ", "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1", "", LM_PUZZLE, "#",
+     "КОРОЛЬ ЧЁРНЫХ ЗАПЕРТ СВОИМИ ПЕШКАМИ. ПОСТАВЬТЕ МАТ В ОДИН ХОД."},
+    {"СПЁРТЫЙ МАТ", "6rk/6pp/8/6N1/8/8/8/7K w - - 0 1", "", LM_PUZZLE, "#",
+     "КОРОЛЮ МЕШАЮТ СОБСТВЕННЫЕ ФИГУРЫ. КОНЬ ПЕРЕПРЫГИВАЕТ ЧЕРЕЗ ЛЮБУЮ ЗАЩИТУ. МАТ В ОДИН ХОД."},
+};
+
+static const LPage LP_ENDGAME[] = {
+    {"АКТИВНЫЙ КОРОЛЬ", "8/5k2/8/3K4/8/8/5P2/8 w - - 0 1", "d5:g", LM_SHOW, "",
+     "В ЭНДШПИЛЕ, КОГДА ФЕРЗЕЙ УЖЕ НЕТ, КОРОЛЬ СТАНОВИТСЯ СИЛЬНОЙ ФИГУРОЙ. ВЕДИТЕ ЕГО В ЦЕНТР И "
+     "ПОМОГАЙТЕ ПЕШКАМ. ПРОХОДНЫЕ ПЕШКИ НАДО ДВИГАТЬ ВПЕРЁД - ОНИ МОГУТ СТАТЬ ФЕРЗЯМИ."},
+    {"МАТ ФЕРЗЁМ", "8/8/8/4k3/8/8/8/3QK3 w - - 0 1", "", LM_SHOW, "",
+     "ФЕРЗЁМ ОТРЕЗАЙТЕ КОРОЛЮ СОПЕРНИКА ПОЛЯ, СУЖАЯ ЕГО КЛЕТКУ, ПОКА ОН НЕ ОКАЖЕТСЯ НА КРАЮ ДОСКИ. "
+     "ЗАТЕМ ПОДВЕДИТЕ СВОЕГО КОРОЛЯ И ДАЙТЕ МАТ.\nОСТОРОЖНО: НЕ ЗАБИРАЙТЕ У КОРОЛЯ ВСЕ ХОДЫ БЕЗ ШАХА - "
+     "ЭТО ПАТ И НИЧЬЯ!"},
+    {"ЗАДАЧА: ФЕРЗЬ", "k7/8/2K5/8/8/8/8/1Q6 w - - 0 1", "", LM_PUZZLE, "#",
+     "КОРОЛЬ ЧЁРНЫХ В УГЛУ. ФЕРЗЮ НУЖНА ПОДДЕРЖКА КОРОЛЯ. НАЙДИТЕ МАТ В ОДИН ХОД."},
+    {"ЗАДАЧА: ЛАДЬЯ", "k7/8/1K6/8/8/8/8/7R w - - 0 1", "", LM_PUZZLE, "#",
+     "КОРОЛЬ ЧЁРНЫХ ПРИЖАТ К КРАЮ, ВАШ КОРОЛЬ НЕ ДАЁТ ЕМУ ВЫЙТИ. ПОСТАВЬТЕ МАТ ЛАДЬЁЙ."},
+    {"ОППОЗИЦИЯ", "4k3/8/4K3/4P3/8/8/8/8 b - - 0 1", "e8:y e6:y", LM_SHOW, "",
+     "КОРОЛИ СТОЯТ ДРУГ НАПРОТИВ ДРУГА ЧЕРЕЗ КЛЕТКУ - ЭТО ОППОЗИЦИЯ. ТОТ, КТО ДОЛЖЕН ХОДИТЬ, ВЫНУЖДЕН "
+     "УСТУПИТЬ ДОРОГУ. ЗДЕСЬ ХОДЯТ ЧЁРНЫЕ, И БЕЛАЯ ПЕШКА ПРОЙДЁТ В ФЕРЗИ."},
+};
+
+static const LPage LP_STRATEGY[] = {
+    {"МЫСЛИ ПЕРЕД ХОДОМ", FEN_ITALIAN, "", LM_SHOW, "",
+     "КАЖДЫЙ ХОД ЗАДАВАЙТЕ СЕБЕ 4 ВОПРОСА:\n1. ЧТО ХОЧЕТ СОПЕРНИК СВОИМ ПОСЛЕДНИМ ХОДОМ?\n"
+     "2. ЕСТЬ ЛИ У МЕНЯ ШАХИ, ВЗЯТИЯ И УГРОЗЫ?\n3. КАКАЯ МОЯ ФИГУРА СТОИТ ХУЖЕ ВСЕХ? УЛУЧШИТЕ ЕЁ.\n"
+     "4. НЕ ОСТАВЛЯЮ ЛИ Я ФИГУРУ БЕЗ ЗАЩИТЫ?"},
+    {"ОТКРЫТЫЕ ЛИНИИ", "6k1/pp3ppp/2n5/8/8/2N5/PP3PPP/3R2K1 w - - 0 1", "d1>d7 d7:g", LM_SHOW, "",
+     "ЛАДЬИ СТАВЬТЕ НА ОТКРЫТЫЕ ВЕРТИКАЛИ, ГДЕ НЕТ ПЕШЕК. ЛАДЬЯ, ВОРВАВШАЯСЯ НА 7-Ю ГОРИЗОНТАЛЬ, "
+     "НАПАДАЕТ НА ПЕШКИ И ЗАПИРАЕТ КОРОЛЯ."},
+    {"ПЕШЕЧНАЯ СТРУКТУРА", "4k3/pp4pp/8/8/8/2P5/P1P2PPP/4K3 w - - 0 1", "c2:r c3:r", LM_SHOW, "",
+     "ПЕШКИ НЕ ХОДЯТ НАЗАД, ПОЭТОМУ КАЖДЫЙ ПЕШЕЧНЫЙ ХОД - РЕШЕНИЕ НАВСЕГДА. ИЗБЕГАЙТЕ СДВОЕННЫХ ПЕШЕК "
+     "(ДВЕ НА ОДНОЙ ВЕРТИКАЛИ, КАК НА c2 И c3) И ИЗОЛИРОВАННЫХ - БЕЗ СОСЕДЕЙ. ДЕРЖИТЕ ПЕШКИ ЦЕПОЧКОЙ, "
+     "ЧТОБЫ ОНИ ЗАЩИЩАЛИ ДРУГ ДРУГА."},
+    {"КОГДА МЕНЯТЬСЯ", "r4rk1/pp3ppp/2n5/8/8/2N5/PP3PPP/R4RK1 w - - 0 1", "", LM_SHOW, "",
+     "ЕСЛИ ВЫ ВПЕРЕДИ ПО МАТЕРИАЛУ - МЕНЯЙТЕ ФИГУРЫ: ЧЕМ МЕНЬШЕ ФИГУР, ТЕМ ЗАМЕТНЕЕ ПЕРЕВЕС. "
+     "ЕСЛИ ОТСТАЁТЕ - ИЗБЕГАЙТЕ РАЗМЕНОВ И ИЩИТЕ АТАКУ. НЕ МЕНЯЙТЕ АКТИВНУЮ ФИГУРУ НА ПАССИВНУЮ."},
+    {"КАК ИГРАТЬ С БОТОМ", FEN_START, "", LM_SHOW, "",
+     "НАЧНИТЕ С УРОВНЯ 1 ИЛИ 2. ВЫИГРАЛИ НЕСКОЛЬКО РАЗ ПОДРЯД - ПОВЫШАЙТЕ УРОВЕНЬ.\n"
+     "ЗЕВНУЛИ ФИГУРУ - НАЖМИТЕ ОТМЕНА И ПОДУМАЙТЕ ЕЩЁ.\nПОСЛЕ ПАРТИИ ПРОСМОТРИТЕ ЗАПИСЬ ХОДОВ И "
+     "НАЙДИТЕ, ГДЕ БЫЛА ОШИБКА.\nИГРАЙТЕ С ЧАСАМИ, ЧТОБЫ НАУЧИТЬСЯ РАСПРЕДЕЛЯТЬ ВРЕМЯ."},
+};
+
+static const LPage LP_NOTATION[] = {
+    {"ЗАПИСЬ ХОДОВ", FEN_ITALIAN, "f3:g c4:g", LM_SHOW, "",
+     "В СПИСКЕ ХОДОВ ФИГУРЫ ОБОЗНАЧАЮТ БУКВАМИ:\nКр - КОРОЛЬ, Ф - ФЕРЗЬ, Л - ЛАДЬЯ, С - СЛОН, К - КОНЬ. "
+     "У ПЕШКИ БУКВЫ НЕТ.\nКf3 - КОНЬ ПОШЁЛ НА f3.\nexd5 - ПЕШКА e ВЗЯЛА НА d5.\n"
+     "x - ВЗЯТИЕ, + - ШАХ, # - МАТ.\n0-0 - КОРОТКАЯ РОКИРОВКА, 0-0-0 - ДЛИННАЯ."},
+};
+
+#define LCH(t, s, a) {t, s, a, (int)(sizeof(a) / sizeof(a[0]))}
+static const LChapter CHAPTERS[] = {
+    LCH("ОСНОВЫ", "ДОСКА, РАССТАНОВКА, ЦЕЛЬ", LP_BASICS),
+    LCH("КАК ХОДЯТ ФИГУРЫ", "ПОПРОБУЙТЕ САМИ НА ДОСКЕ", LP_PIECES),
+    LCH("ОСОБЫЕ ХОДЫ", "РОКИРОВКА, ВЗЯТИЕ НА ПРОХОДЕ", LP_SPECIAL),
+    LCH("ШАХ, МАТ И НИЧЬЯ", "КАК ЗАКАНЧИВАЕТСЯ ПАРТИЯ", LP_ENDING),
+    LCH("ЦЕННОСТЬ ФИГУР", "ЧТО НА ЧТО МЕНЯТЬ", LP_VALUE),
+    LCH("ДЕБЮТ", "КАК НАЧИНАТЬ ПАРТИЮ", LP_OPENING),
+    LCH("ТАКТИКА", "ВИЛКА, СВЯЗКА, ЗАДАЧИ", LP_TACTICS),
+    LCH("ЭНДШПИЛЬ", "КАК ДОВЕСТИ ДЕЛО ДО МАТА", LP_ENDGAME),
+    LCH("СТРАТЕГИЯ", "ПЛАН И ПОЛЕЗНЫЕ СОВЕТЫ", LP_STRATEGY),
+    LCH("ЗАПИСЬ ХОДОВ", "КАК ЧИТАТЬ СПИСОК ХОДОВ", LP_NOTATION),
+};
+static const int NCHAP = (int)(sizeof(CHAPTERS) / sizeof(CHAPTERS[0]));
+
+struct LMark {
+    int kind;  // 0 — подсветка, 1 — стрелка
+    int a, b;
+    char c;
+};
+static int gLCh = 0, gLPg = 0;
+static eng::Board gLB;
+static bool gLWB = true;
+static int gLSel = -1;
+static std::vector<eng::Move> gLTargets;
+static int gLStatus = 0;  // 0 — думаем, 1 — верно, 2 — неверно
+static int gLTries = 0;
+static Uint32 gLResetAt = 0;
+static eng::Move gLHint = 0;
+static bool gLShowHint = false;
+static int gLLastFrom = -1, gLLastTo = -1;
+static std::vector<LMark> gLMarks;
+
+static int parseSq(const char *s) {
+    if (s[0] < 'a' || s[0] > 'h' || s[1] < '1' || s[1] > '8') return -1;
+    return (s[1] - '1') * 8 + (s[0] - 'a');
+}
+static const LPage &curPage() { return CHAPTERS[gLCh].pages[gLPg]; }
+static int puzzlesIn(int ch) {
+    int n = 0;
+    for (int i = 0; i < CHAPTERS[ch].n; i++)
+        if (CHAPTERS[ch].pages[i].mode == LM_PUZZLE) n++;
+    return n;
+}
+static int solvedIn(int ch) {
+    int n = 0;
+    for (int i = 0; i < CHAPTERS[ch].n; i++)
+        if (CHAPTERS[ch].pages[i].mode == LM_PUZZLE && (gSolved[ch] >> i & 1)) n++;
+    return n;
+}
+
+static bool isMateMove(eng::Board b, eng::Move m) {
+    eng::Undo u;
+    b.make(m, u);
+    if (!b.inCheck(b.side)) return false;
+    eng::MoveList ml;
+    b.genLegal(ml);
+    return ml.n == 0;
+}
+static bool puzzleOk(eng::Board &b, eng::Move m, const char *sol) {
+    if (strcmp(sol, "#") == 0) return isMateMove(b, m);
+    return eng::toUCI(m).compare(0, 4, std::string(sol).substr(0, 4)) == 0;
+}
+
+static void lessonTargets() {
+    gLTargets.clear();
+    if (gLSel < 0) return;
+    eng::MoveList ml;
+    gLB.genLegal(ml);
+    for (int i = 0; i < ml.n; i++)
+        if (eng::mFrom(ml.m[i]) == gLSel) gLTargets.push_back(ml.m[i]);
+}
+
+static void loadLessonPage(bool fresh) {
+    const LPage &p = curPage();
+    gLB.setFEN(p.fen);
+    gLWB = !(p.mode == LM_PUZZLE && gLB.side == eng::BLACK);
+    gLSel = -1;
+    gLTargets.clear();
+    gLStatus = 0;
+    gLResetAt = 0;
+    gLLastFrom = gLLastTo = -1;
+    if (fresh) {
+        gLTries = 0;
+        gLShowHint = false;
+    }
+    gLMarks.clear();
+    const char *s = p.marks;
+    while (*s) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+        int a = parseSq(s);
+        if (a >= 0 && s[2] == ':' && s[3]) {
+            LMark m;
+            m.kind = 0; m.a = a; m.b = -1; m.c = s[3];
+            gLMarks.push_back(m);
+            s += 4;
+        } else if (a >= 0 && s[2] == '>' && parseSq(s + 3) >= 0) {
+            LMark m;
+            m.kind = 1; m.a = a; m.b = parseSq(s + 3); m.c = 'g';
+            gLMarks.push_back(m);
+            s += 5;
+        } else {
+            while (*s && *s != ' ') s++;
+        }
+    }
+    if (p.mode == LM_MOVES) {
+        gLSel = parseSq(p.sol);
+        lessonTargets();
+    }
+    gLHint = 0;
+    if (p.mode == LM_PUZZLE) {
+        eng::MoveList ml;
+        gLB.genLegal(ml);
+        for (int i = 0; i < ml.n; i++)
+            if (puzzleOk(gLB, ml.m[i], p.sol)) { gLHint = ml.m[i]; break; }
+    }
+}
+
+static void openLesson(int ch, int pg) {
+    gLCh = std::max(0, std::min(NCHAP - 1, ch));
+    gLPg = std::max(0, std::min(CHAPTERS[gLCh].n - 1, pg));
+    loadLessonPage(true);
+}
+
+static void lessonMove(eng::Move m) {
+    const LPage &p = curPage();
+    int from = eng::mFrom(m), to = eng::mTo(m);
+    bool cap = (eng::mFlags(m) & eng::F_CAP) != 0;
+    if (p.mode == LM_MOVES) {
+        int c = gLB.side;
+        eng::Undo u;
+        gLB.make(m, u);
+        gLB.side = c;  // ходит всё время одна сторона — это «песочница»
+        gLB.ep = -1;
+        gLB.hash = gLB.computeHash();
+        gLLastFrom = from;
+        gLLastTo = to;
+        gLSel = to;
+        lessonTargets();
+        playSound(cap ? SND_CAPTURE : SND_MOVE);
+        return;
+    }
+    bool ok = puzzleOk(gLB, m, p.sol);
+    eng::Undo u;
+    gLB.make(m, u);
+    gLLastFrom = from;
+    gLLastTo = to;
+    gLSel = -1;
+    gLTargets.clear();
+    if (ok) {
+        gLStatus = 1;
+        gLShowHint = false;
+        gSolved[gLCh] |= 1 << gLPg;
+        playSound(SND_END);
+        saveAll();
+    } else {
+        gLStatus = 2;
+        gLTries++;
+        if (gLTries >= 2) gLShowHint = true;
+        gLResetAt = SDL_GetTicks() + 1100;
+        playSound(SND_CHECK);
+    }
+}
+
+static void lessonTap(int sq) {
+    const LPage &p = curPage();
+    if (p.mode == LM_SHOW || gLStatus == 1 || gLResetAt) return;
+    if (gLSel >= 0) {
+        eng::Move pick = 0;
+        for (auto m : gLTargets)
+            if (eng::mTo(m) == sq && (!pick || eng::mPromo(m) == eng::QUEEN)) pick = m;
+        if (pick) {
+            lessonMove(pick);
+            return;
+        }
+    }
+    int pc = gLB.sq[sq];
+    if (pc && eng::pColor(pc) == gLB.side) {
+        gLSel = (gLSel == sq && p.mode == LM_PUZZLE) ? -1 : sq;
+        lessonTargets();
+        playSound(SND_CLICK);
+        return;
+    }
+    if (p.mode == LM_PUZZLE) {
+        gLSel = -1;
+        gLTargets.clear();
+    }
+}
+
+// =====================================================================
+//                     СЕТЬ: ПРОТОКОЛ ПАРТИИ
+// =====================================================================
+// Строки текста: HELLO, START <цвет хозяина> <мс>, MOVE <номер> <ход> <мс>,
+// RESIGN, TIMEOUT, OFFER DRAW|NEW, ACCEPT DRAW|NEW, DECLINE, BYE, PING.
+enum { NU_MENU, NU_WAIT, NU_JOIN, NU_KEYPAD, NU_CONNECTING };
+static int gNetUI = NU_MENU;
+static std::string gNetMsg;
+static std::string gNetIpInput;
+
+static void startNetMatch(int myColor, int clockMs) {
+    cancelBot();
+    if (!gHaveBackup && gM.mode != MODE_NET) {
+        gBackup = gM;
+        gHaveBackup = true;
+    }
+    gM.active = true;
+    gM.mode = MODE_NET;
+    gM.human = myColor;
+    gM.level = 1;
+    gM.clockInit = std::max(0, clockMs);
+    gM.tLeft[0] = gM.tLeft[1] = gM.clockInit;
+    gM.flip = false;
+    gM.recorded = false;
+    gM.g.reset();
+    gViewSide = eng::WHITE;
+    clearSel();
+    gAnims.clear();
+    gResultPending = false;
+    gOverlay = OV_NONE;
+    gConfirm = CF_NONE;
+    gListScroll = 0;
+    gScreen = SC_GAME;
+    gLastTick = SDL_GetTicks();
+    playSound(SND_CLICK);
+    toast(myColor == eng::WHITE ? "ВЫ ИГРАЕТЕ БЕЛЫМИ" : "ВЫ ИГРАЕТЕ ЧЁРНЫМИ");
+}
+
+// Выход из сетевой игры: закрыть соединение и вернуть отложенную партию
+static void netLeave(bool sendBye) {
+    if (sendBye && gNet.state == NS_CONNECTED) {
+        netSendLine("BYE");
+        netFlush();
+    }
+    netCloseAll();
+    if (gM.mode == MODE_NET) {
+        if (gHaveBackup) gM = gBackup;
+        else gM = Match();
+        gHaveBackup = false;
+        gViewSide = gM.g.cur.side;
+        gOverlay = OV_NONE;
+        gConfirm = CF_NONE;
+        clearSel();
+        gAnims.clear();
+        gResultPending = false;
+    }
+}
+
+static void netOffer(const char *what) {
+    if (!netConnected()) {
+        toast("НЕТ СВЯЗИ С СОПЕРНИКОМ");
+        return;
+    }
+    netSendLine(std::string("OFFER ") + what);
+    toast("ПРЕДЛОЖЕНИЕ ОТПРАВЛЕНО");
+}
+
+static void netHandleLine(const std::string &l) {
+    char cmd[32] = {0}, arg[32] = {0};
+    if (sscanf(l.c_str(), "%31s %31s", cmd, arg) < 1) return;
+    std::string c = cmd, a = arg;
+    if (c == "PING") return;
+    if (c == "HELLO") {
+        if (!gNet.isHost || gM.mode == MODE_NET) return;
+        int hc = gSet.color == 2 ? (int)((SDL_GetPerformanceCounter() >> 3) & 1) : gSet.color;
+        static const int MIN[4] = {0, 5, 10, 15};
+        int ms = MIN[gSet.clock] * 60000;
+        netSendLine("START " + std::to_string(hc) + " " + std::to_string(ms));
+        startNetMatch(hc, ms);
+        return;
+    }
+    if (c == "START") {
+        if (gNet.isHost) return;
+        int hc = 0, ms = 0;
+        sscanf(l.c_str() + 5, "%d %d", &hc, &ms);
+        startNetMatch(hc == eng::WHITE ? eng::BLACK : eng::WHITE, ms);
+        return;
+    }
+    if (gM.mode != MODE_NET) return;
+    int opp = gM.human ^ 1;
+    if (c == "MOVE") {
+        int ply = -1;
+        char u[16] = {0};
+        long long ms = 0;
+        if (sscanf(l.c_str() + 4, "%d %15s %lld", &ply, u, &ms) < 2) return;
+        if (gM.g.result != RES_NONE || ply != (int)gM.g.moves.size() || gM.g.cur.side != opp) {
+            toast("ОШИБКА СИНХРОНИЗАЦИИ");
+            return;
+        }
+        eng::MoveList ml;
+        gM.g.cur.genLegal(ml);
+        for (int i = 0; i < ml.n; i++)
+            if (eng::toUCI(ml.m[i]) == u) {
+                if (gM.clockInit > 0) gM.tLeft[opp] = std::max(0LL, ms);
+                if (gOverlay == OV_PROMO) gOverlay = OV_NONE;
+                playMove(ml.m[i], true);
+                return;
+            }
+        toast("ОШИБКА СИНХРОНИЗАЦИИ");
+        return;
+    }
+    if (c == "RESIGN") {
+        if (gM.g.result == RES_NONE) {
+            gM.g.result = opp == eng::WHITE ? RES_BLACK : RES_WHITE;
+            gM.g.reason = R_RESIGN;
+            gM.g.loser = opp;
+            onGameEnd();
+        }
+        return;
+    }
+    if (c == "TIMEOUT") {
+        if (gM.g.result == RES_NONE) onTimeout(opp);
+        return;
+    }
+    if (c == "OFFER") {
+        if (a == "DRAW" && gM.g.result != RES_NONE) return;
+        gConfirm = a == "DRAW" ? CF_NET_DRAW : CF_NET_NEW;
+        gOverlay = OV_CONFIRM;
+        clearSel();
+        playSound(SND_CHECK);
+        return;
+    }
+    if (c == "ACCEPT") {
+        if (a == "DRAW") {
+            if (gM.g.result == RES_NONE) {
+                gM.g.result = RES_DRAW;
+                gM.g.reason = R_AGREE;
+                onGameEnd();
+            }
+        } else if (a == "NEW") {
+            startNetMatch(gM.human ^ 1, gM.clockInit);
+        }
+        return;
+    }
+    if (c == "DECLINE") {
+        toast("СОПЕРНИК ОТКАЗАЛСЯ");
+        return;
+    }
+    if (c == "BYE") {
+        netCloseAll();
+        if (gM.g.result == RES_NONE) {
+            gM.g.result = gM.human == eng::WHITE ? RES_WHITE : RES_BLACK;
+            gM.g.reason = R_LEFT;
+            gM.g.loser = opp;
+            onGameEnd();
+        } else {
+            toast("СОПЕРНИК ВЫШЕЛ ИЗ ИГРЫ");
+        }
+        if (gOverlay == OV_CONFIRM) {
+            gOverlay = OV_NONE;
+            gConfirm = CF_NONE;
+        }
+    }
+}
+
+static void netPoll() {
+    bool wasConnecting = gNet.state == NS_CONNECTING;
+    netPollIO();
+    if (wasConnecting && gNet.state == NS_IDLE) {
+        gNetUI = NU_JOIN;
+        gNetMsg = "НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ";
+        netScanStart();
+    }
+    if (gNet.lost && gNet.state == NS_CONNECTED) {
+        netCloseAll();
+        if (gM.mode == MODE_NET && gScreen == SC_GAME) {
+            if (gM.g.result == RES_NONE) {
+                gConfirm = CF_NET_LOST;
+                gOverlay = OV_CONFIRM;
+                clearSel();
+            } else {
+                toast("СОПЕРНИК ОТКЛЮЧИЛСЯ");
+            }
+        } else if (gScreen == SC_NET) {
+            gNetUI = NU_MENU;
+            gNetMsg = "СВЯЗЬ ПОТЕРЯНА";
+        }
+    }
+}
+
+static std::string foundLabel(const FoundGame &f) {
+    std::string s = f.ip + " · ВЫ ";
+    s += f.color == 0 ? "ЧЁРНЫЕ" : f.color == 1 ? "БЕЛЫЕ" : "СЛУЧАЙНО";
+    if (f.clockMin > 0) s += " · " + std::to_string(f.clockMin) + " МИН";
+    return s;
+}
+
+static bool netBusy() { return gNet.state != NS_IDLE || gNet.scan != SOCK_BAD; }
 
 // =====================================================================
 //                         РАЗМЕТКА И КНОПКИ
@@ -2385,10 +3367,15 @@ enum {
     B_YES, B_NO,
     B_RES_NEW, B_RES_MENU, B_RES_VIEW,
     B_PROMO_Q, B_PROMO_R, B_PROMO_B, B_PROMO_N,
-    B_RESET
+    B_RESET,
+    B_LEARN, B_L_PREV, B_L_MID, B_L_NEXT,
+    B_PLAY_NET, B_NET_HOST, B_NET_JOIN, B_NET_CANCEL, B_NET_MANUAL, B_NET_GO, B_DRAW,
+    B_KEY0, B_KEY1, B_KEY2, B_KEY3, B_KEY4, B_KEY5, B_KEY6, B_KEY7, B_KEY8, B_KEY9, B_KEY_DOT, B_KEY_DEL,
+    B_FOUND0, B_FOUND1, B_FOUND2, B_FOUND3, B_FOUND4, B_FOUND5,
+    B_CH0  // B_CH0 + номер темы — должна быть последней
 };
 enum { ST_NORMAL, ST_PRIMARY, ST_DANGER, ST_SEG, ST_TOOL };
-enum { IC_NONE, IC_UNDO, IC_FLAG, IC_PLUS, IC_FLIP, IC_MENU };
+enum { IC_NONE, IC_UNDO, IC_FLAG, IC_PLUS, IC_FLIP, IC_MENU, IC_EQUAL };
 
 struct Btn {
     SDL_FRect r;
@@ -2423,6 +3410,38 @@ static bool inRect(const SDL_FRect &r, float x, float y) {
 
 static float uiU() { return std::min((float)gW, gH * 0.56f) / 100.0f; }
 static int uiTS() { return std::max(1, (int)std::lround(uiU() * 0.52f)); }
+
+struct LessonLayout {
+    float top, pad, hdrY, titleY, bx, by, cell, S, statusY, textX, textY, textW, textH, btnY, btnH;
+    int ts, tsT, tsB;
+};
+static LessonLayout lessonLayout() {
+    LessonLayout L;
+    float W = (float)gW, H = (float)gH, U = uiU();
+    L.top = H * 0.05f;
+    L.pad = std::max(6.0f, U * 4.0f);
+    L.ts = uiTS();
+    L.tsT = L.ts + 2;
+    L.tsB = std::max(1, (int)std::lround(U * 0.46f));
+    L.hdrY = L.top + U * 2;
+    L.titleY = L.hdrY + textH(std::max(1, L.ts - 1)) + U * 2.5f;
+    L.btnH = std::max(40.0f, U * 13.0f);
+    L.btnY = H - U * 4 - L.btnH;
+    float S = std::min(W - 2 * L.pad, H * 0.38f);
+    float cell = std::floor(S / 8.0f);
+    if (cell < 6) cell = 6;
+    L.cell = cell;
+    L.S = cell * 8;
+    L.bx = std::floor((W - L.S) * 0.5f);
+    L.by = std::floor(L.titleY + textH(L.tsT) + U * 4);
+    L.statusY = L.by + L.S + U * 3;
+    float statusH = curPage().mode == LM_SHOW ? 0.0f : textH(L.ts) + U * 3;
+    L.textX = L.pad;
+    L.textW = W - 2 * L.pad;
+    L.textY = L.statusY + statusH;
+    L.textH = L.btnY - U * 3 - L.textY;
+    return L;
+}
 
 struct GameLayout {
     float top, pad, barH, btnH, bx, by, cell, S, topBarY, botBarY, listX, listY, listW, listH, btnY;
@@ -2463,7 +3482,7 @@ static GameLayout gameLayout() {
 }
 
 static bool whiteBottom() {
-    bool base = gM.mode == MODE_BOT ? gM.human == eng::WHITE : gViewSide == eng::WHITE;
+    bool base = gM.mode != MODE_TWO ? gM.human == eng::WHITE : gViewSide == eng::WHITE;
     return base != gM.flip;
 }
 
@@ -2498,7 +3517,7 @@ static MenuM menuMetrics() {
     m.bw = std::min(W * 0.82f, U * 82.0f);
     m.bh = std::max(40.0f, U * 14.0f);
     m.gap = U * 3.2f;
-    int rows = m.cont ? 5 : 4;
+    int rows = m.cont ? 6 : 5;
     float total = rows * m.bh + (rows - 1) * m.gap;
     m.ps = std::min(W * 0.36f, H * 0.17f);
     m.tts = std::max(2, std::min((int)(W * 0.8f / (7 * 6)), (int)(H * 0.075f / 7)));
@@ -2529,7 +3548,13 @@ static void buildScreenButtons() {
         }
         gScreenBtns.push_back(mkBtn(x, y, bw, bh, B_PLAY_BOT, "ИГРА С БОТОМ", cont ? ST_NORMAL : ST_PRIMARY, bts));
         y += bh + gap;
-        gScreenBtns.push_back(mkBtn(x, y, bw, bh, B_PLAY_TWO, "ИГРА ВДВОЁМ", ST_NORMAL, bts));
+        {
+            float hw = (bw - gap) * 0.5f;
+            gScreenBtns.push_back(mkBtn(x, y, hw, bh, B_PLAY_TWO, "ВДВОЁМ", ST_NORMAL, bts));
+            gScreenBtns.push_back(mkBtn(x + hw + gap, y, hw, bh, B_PLAY_NET, "ПО СЕТИ", ST_NORMAL, bts));
+        }
+        y += bh + gap;
+        gScreenBtns.push_back(mkBtn(x, y, bw, bh, B_LEARN, "ОБУЧЕНИЕ", ST_NORMAL, bts));
         y += bh + gap;
         gScreenBtns.push_back(mkBtn(x, y, bw, bh, B_STATS, "СТАТИСТИКА", ST_NORMAL, bts));
         y += bh + gap;
@@ -2572,6 +3597,81 @@ static void buildScreenButtons() {
         float yb = H - U * 6 - bh2;
         gScreenBtns.push_back(mkBtn(x, yb - bh2 - U * 3, bw, bh2, B_START, "НАЧАТЬ ИГРУ", ST_PRIMARY, ts + 1));
         gScreenBtns.push_back(mkBtn(x, yb, bw, bh2, B_BACK, "НАЗАД", ST_NORMAL, ts + 1));
+    } else if (gScreen == SC_NET) {
+        float bw = std::min(W * 0.9f, U * 90.0f), x = (W - bw) * 0.5f;
+        float bh = std::max(36.0f, U * 12.5f), gap = U * 2.0f;
+        float bh2 = std::max(40.0f, U * 14.0f);
+        float yb = H - U * 6 - bh2;
+        float top = H * 0.05f;
+        if (gNetUI == NU_MENU) {
+            float y = top + U * 30 + textH(ts) + U * 3;
+            float cw = (bw - 2 * gap) / 3;
+            const char *cl[3] = {"БЕЛЫЕ", "ЧЁРНЫЕ", "СЛУЧАЙНО"};
+            for (int i = 0; i < 3; i++) {
+                Btn b = mkBtn(x + i * (cw + gap), y, cw, bh * 1.35f, B_COL_W + i, cl[i], ST_SEG, ts);
+                b.selected = gSet.color == i;
+                b.piece = i == 0 ? eng::mkPiece(eng::WHITE, eng::KING) : (i == 1 ? eng::mkPiece(eng::BLACK, eng::KING) : -1);
+                gScreenBtns.push_back(b);
+            }
+            y += bh * 1.35f + U * 7 + textH(ts) + U * 3;
+            float kw = (bw - 3 * gap) / 4;
+            const char *kl[4] = {"НЕТ", "5 МИН", "10 МИН", "15 МИН"};
+            for (int i = 0; i < 4; i++) {
+                Btn b = mkBtn(x + i * (kw + gap), y, kw, bh, B_CLK0 + i, kl[i], ST_SEG, ts);
+                b.selected = gSet.clock == i;
+                gScreenBtns.push_back(b);
+            }
+            gScreenBtns.push_back(mkBtn(x, yb - 2 * (bh2 + U * 3), bw, bh2, B_NET_HOST, "СОЗДАТЬ ИГРУ", ST_PRIMARY, ts + 1));
+            gScreenBtns.push_back(mkBtn(x, yb - (bh2 + U * 3), bw, bh2, B_NET_JOIN, "ПОДКЛЮЧИТЬСЯ", ST_NORMAL, ts + 1));
+            gScreenBtns.push_back(mkBtn(x, yb, bw, bh2, B_BACK, "НАЗАД", ST_NORMAL, ts + 1));
+        } else if (gNetUI == NU_JOIN) {
+            float y = top + U * 36;
+            for (int i = 0; i < (int)gFound.size() && i < 4; i++) {
+                gScreenBtns.push_back(mkBtn(x, y, bw, bh2, B_FOUND0 + i, foundLabel(gFound[i]), ST_PRIMARY, ts));
+                y += bh2 + U * 3;
+            }
+            gScreenBtns.push_back(mkBtn(x, yb - (bh2 + U * 3), bw, bh2, B_NET_MANUAL, "ВВЕСТИ АДРЕС", ST_NORMAL, ts + 1));
+            gScreenBtns.push_back(mkBtn(x, yb, bw, bh2, B_NET_CANCEL, "НАЗАД", ST_NORMAL, ts + 1));
+        } else if (gNetUI == NU_KEYPAD) {
+            float y = top + U * 30 + U * 14 + U * 5;
+            float kw = (bw - 2 * gap) / 3;
+            float avail = yb - (bh2 + U * 3) - U * 4 - y;
+            float kh = std::min(U * 13.0f, (avail - 3 * gap) / 4);
+            const char *keys[12] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "0", "СТЕРЕТЬ"};
+            int kid[12] = {B_KEY1, B_KEY2, B_KEY3, B_KEY4, B_KEY5, B_KEY6, B_KEY7, B_KEY8, B_KEY9, B_KEY_DOT, B_KEY0, B_KEY_DEL};
+            for (int i = 0; i < 12; i++)
+                gScreenBtns.push_back(mkBtn(x + (i % 3) * (kw + gap), y + (i / 3) * (kh + gap), kw, kh, kid[i], keys[i],
+                                            i == 11 ? ST_DANGER : ST_NORMAL, i < 11 ? ts + 2 : ts));
+            gScreenBtns.push_back(mkBtn(x, yb - (bh2 + U * 3), bw, bh2, B_NET_GO, "ПОДКЛЮЧИТЬСЯ", ST_PRIMARY, ts + 1));
+            gScreenBtns.push_back(mkBtn(x, yb, bw, bh2, B_NET_CANCEL, "НАЗАД", ST_NORMAL, ts + 1));
+        } else {
+            gScreenBtns.push_back(mkBtn(x, yb, bw, bh2, B_NET_CANCEL, "ОТМЕНА", ST_NORMAL, ts + 1));
+        }
+    } else if (gScreen == SC_LEARN) {
+        float bw = std::min(W * 0.9f, U * 90.0f), x = (W - bw) * 0.5f;
+        float top = H * 0.05f;
+        float y0 = top + U * 6 + textH(ts * 2) + U * 3 + textH(std::max(1, ts - 1)) + U * 5;
+        float bhB = std::max(40.0f, U * 13.0f);
+        float yb = H - U * 4 - bhB;
+        float gap = U * 1.8f;
+        float bh = std::min(U * 13.5f, (yb - U * 4 - y0 - (NCHAP - 1) * gap) / NCHAP);
+        for (int i = 0; i < NCHAP; i++) gScreenBtns.push_back(mkBtn(x, y0 + i * (bh + gap), bw, bh, B_CH0 + i, "", ST_NORMAL, ts));
+        gScreenBtns.push_back(mkBtn(x, yb, bw, bhB, B_BACK, "НАЗАД", ST_NORMAL, ts + 1));
+    } else if (gScreen == SC_LESSON) {
+        LessonLayout L = lessonLayout();
+        float gap = U * 2.0f;
+        float bw = (W - 2 * L.pad - 2 * gap) / 3;
+        const LPage &p = curPage();
+        bool last = gLPg >= CHAPTERS[gLCh].n - 1;
+        Btn prev = mkBtn(L.pad, L.btnY, bw, L.btnH, B_L_PREV, "НАЗАД", ST_NORMAL, ts);
+        prev.enabled = gLPg > 0;
+        std::string mid = p.mode == LM_SHOW ? "ТЕМЫ" : p.mode == LM_MOVES ? "СБРОС" : (gLStatus == 1 ? "СНОВА" : "ПОДСКАЗКА");
+        Btn m = mkBtn(L.pad + bw + gap, L.btnY, bw, L.btnH, B_L_MID, mid, ST_NORMAL, ts);
+        std::string nx = !last ? "ДАЛЕЕ" : (gLCh < NCHAP - 1 ? "ДАЛЕЕ" : "ГОТОВО");
+        Btn n = mkBtn(L.pad + 2 * (bw + gap), L.btnY, bw, L.btnH, B_L_NEXT, nx, ST_PRIMARY, ts);
+        gScreenBtns.push_back(prev);
+        gScreenBtns.push_back(m);
+        gScreenBtns.push_back(n);
     } else if (gScreen == SC_STATS) {
         float bw = std::min(W * 0.82f, U * 82.0f), x = (W - bw) * 0.5f, bh = std::max(40.0f, U * 14.0f);
         float yb = H - U * 6 - bh;
@@ -2581,16 +3681,19 @@ static void buildScreenButtons() {
         GameLayout L = gameLayout();
         float gap = L.pad * 0.5f;
         float bw = (L.listW - 4 * gap) / 5;
-        const char *lb[5] = {"ОТМЕНА", "СДАТЬСЯ", "НОВАЯ", "ПОВОРОТ", "МЕНЮ"};
-        int ids[5] = {B_UNDO, B_RESIGN, B_NEW, B_FLIP, B_MENU};
-        int ic[5] = {IC_UNDO, IC_FLAG, IC_PLUS, IC_FLIP, IC_MENU};
+        bool net = gM.mode == MODE_NET;
+        const char *lb[5] = {net ? "НИЧЬЯ" : "ОТМЕНА", "СДАТЬСЯ", "НОВАЯ", "ПОВОРОТ", "МЕНЮ"};
+        int ids[5] = {net ? B_DRAW : B_UNDO, B_RESIGN, B_NEW, B_FLIP, B_MENU};
+        int ic[5] = {net ? IC_EQUAL : IC_UNDO, IC_FLAG, IC_PLUS, IC_FLIP, IC_MENU};
         int lts = L.tsSmall;
         for (int i = 0; i < 5; i++) lts = std::min(lts, fitScale(lb[i], bw * 0.9f, L.tsSmall));
         for (int i = 0; i < 5; i++) {
             Btn b = mkBtn(L.listX + i * (bw + gap), L.btnY, bw, L.btnH, ids[i], lb[i], ST_TOOL, lts);
             b.icon = ic[i];
             if (ids[i] == B_UNDO) b.enabled = canUndo();
-            if (ids[i] == B_RESIGN) b.enabled = gM.g.result == RES_NONE;
+            if (ids[i] == B_RESIGN) b.enabled = gM.g.result == RES_NONE && (!net || netConnected());
+            if (ids[i] == B_DRAW) b.enabled = gM.g.result == RES_NONE && netConnected() && !gM.g.moves.empty();
+            if (ids[i] == B_NEW && net) b.enabled = netConnected();
             gScreenBtns.push_back(b);
         }
     }
@@ -2617,8 +3720,10 @@ static void buildOverlayButtons() {
         Panel p = overlayPanel(52);
         float bw = (p.w - U * 12) / 2, bh = std::max(40.0f, U * 13.0f);
         float y = p.y + p.h - bh - U * 5;
-        gOverBtns.push_back(mkBtn(p.x + U * 4, y, bw, bh, B_YES, "ДА", gConfirm == CF_NEW ? ST_PRIMARY : ST_DANGER, ts + 1));
-        gOverBtns.push_back(mkBtn(p.x + p.w - U * 4 - bw, y, bw, bh, B_NO, "НЕТ", ST_NORMAL, ts + 1));
+        bool lostMsg = gConfirm == CF_NET_LOST;
+        int yesStyle = (gConfirm == CF_NEW || gConfirm == CF_NET_DRAW || gConfirm == CF_NET_NEW || lostMsg) ? ST_PRIMARY : ST_DANGER;
+        gOverBtns.push_back(mkBtn(p.x + U * 4, y, bw, bh, B_YES, lostMsg ? "В МЕНЮ" : "ДА", yesStyle, ts + 1));
+        gOverBtns.push_back(mkBtn(p.x + p.w - U * 4 - bw, y, bw, bh, B_NO, lostMsg ? "ЗАКРЫТЬ" : "НЕТ", ST_NORMAL, ts + 1));
     } else if (gOverlay == OV_RESULT) {
         Panel p = overlayPanel(106);
         float bw = p.w - U * 10, bh = std::max(38.0f, U * 12.5f), gap = U * 2.5f;
@@ -2732,6 +3837,10 @@ static void drawIcon(int ic, float cx, float cy, float s, Col c) {
         }
         case IC_MENU:
             for (int i = -1; i <= 1; i++) thickLine(cx - s * 0.34f, cy + i * s * 0.28f, cx + s * 0.34f, cy + i * s * 0.28f, w, c);
+            break;
+        case IC_EQUAL:
+            thickLine(cx - s * 0.34f, cy - s * 0.17f, cx + s * 0.34f, cy - s * 0.17f, w * 1.2f, c);
+            thickLine(cx - s * 0.34f, cy + s * 0.17f, cx + s * 0.34f, cy + s * 0.17f, w * 1.2f, c);
             break;
         default: break;
     }
@@ -2851,22 +3960,24 @@ static void drawStats() {
     int total = gStats.wins + gStats.losses + gStats.draws;
     int pct = total ? (int)std::lround(100.0 * (gStats.wins + 0.5 * gStats.draws) / total) : 0;
     struct Row { const char *l; std::string v; Col c; };
-    Row rows[6] = {
+    std::string netv = std::to_string(gStats.netW) + "-" + std::to_string(gStats.netL) + "-" + std::to_string(gStats.netD);
+    Row rows[7] = {
         {"ПОБЕДЫ", std::to_string(gStats.wins), C(120, 214, 120)},
         {"ПОРАЖЕНИЯ", std::to_string(gStats.losses), C(232, 110, 100)},
         {"НИЧЬИ", std::to_string(gStats.draws), C(200, 200, 210)},
         {"ВСЕГО С БОТОМ", std::to_string(total), COL_TEXT},
         {"РЕЗУЛЬТАТ", std::to_string(pct) + "%", COL_GOLD},
         {"ПАРТИЙ ВДВОЁМ", std::to_string(gStats.two), COL_TEXT},
+        {"ПО СЕТИ (В-П-Н)", netv, COL_TEXT},
     };
-    float ph = lh * 6 + U * 6;
+    float ph = lh * 7 + U * 6;
     fillRRect(px, py, pw, ph, U * 3, C(36, 46, 62, 230));
     float y = py + U * 3 + (lh - textH(ts + 1)) * 0.5f;
-    for (int i = 0; i < 6; i++) {
-        int sc = fitScale(rows[i].l, pw * 0.65f, ts + 1);
+    for (int i = 0; i < 7; i++) {
+        int sc = fitScale(rows[i].l, pw * 0.6f, ts + 1);
         text(rows[i].l, px + U * 4, y, sc, COL_DIM, 0, false);
         text(rows[i].v, px + pw - U * 4, y, ts + 1, rows[i].c, 2);
-        if (i < 5) fillRect(px + U * 4, y + lh - (lh - textH(ts + 1)) * 0.5f - 1, pw - U * 8, 1, C(255, 255, 255, 18));
+        if (i < 6) fillRect(px + U * 4, y + lh - (lh - textH(ts + 1)) * 0.5f - 1, pw - U * 8, 1, C(255, 255, 255, 18));
         y += lh;
     }
     // полоска соотношения
@@ -2932,6 +4043,8 @@ static void drawPlayerBar(const GameLayout &L, float y, int color) {
     if (gM.mode == MODE_BOT) {
         if (color == gM.human) name = "ВЫ";
         else name = "БОТ · " + std::string(LEVEL_NAME[gM.level]);
+    } else if (gM.mode == MODE_NET) {
+        name = color == gM.human ? "ВЫ" : "СОПЕРНИК";
     } else {
         name = sideName(color, true);
     }
@@ -3093,12 +4206,18 @@ static std::string statusText(Col &c) {
         c = COL_GOLD;
         if (g.result == RES_DRAW) return "НИЧЬЯ";
         int win = g.result == RES_WHITE ? eng::WHITE : eng::BLACK;
-        if (gM.mode == MODE_BOT) return win == gM.human ? "ВЫ ПОБЕДИЛИ!" : "ВЫ ПРОИГРАЛИ";
+        if (gM.mode != MODE_TWO) return win == gM.human ? "ВЫ ПОБЕДИЛИ!" : "ВЫ ПРОИГРАЛИ";
         return "ПОБЕДИЛИ " + sideName(win, true);
     }
     bool chk = g.cur.inCheck(g.cur.side);
     std::string s;
-    if (gM.mode == MODE_BOT) {
+    if (gM.mode == MODE_NET) {
+        if (!netConnected()) {
+            c = C(255, 120, 100);
+            return "НЕТ СВЯЗИ С СОПЕРНИКОМ";
+        }
+        s = g.cur.side == gM.human ? "ВАШ ХОД" : "ХОД СОПЕРНИКА";
+    } else if (gM.mode == MODE_BOT) {
         if (g.cur.side == gM.human) s = "ВАШ ХОД";
         else {
             int dots = (SDL_GetTicks() / 350) % 4;
@@ -3184,6 +4303,343 @@ static void drawGame() {
     drawBoard(L);
 }
 
+// ---------- обучение ----------
+static std::vector<std::string> wrapText(const std::string &s, int sc, float maxW) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        size_t e = s.find('\n', pos);
+        if (e == std::string::npos) e = s.size();
+        std::string para = s.substr(pos, e - pos);
+        std::string cur;
+        size_t i = 0;
+        while (i < para.size()) {
+            while (i < para.size() && para[i] == ' ') i++;
+            size_t j = i;
+            while (j < para.size() && para[j] != ' ') j++;
+            if (j > i) {
+                std::string w = para.substr(i, j - i);
+                std::string test = cur.empty() ? w : cur + " " + w;
+                if (cur.empty() || textW(test, sc) <= maxW) cur = test;
+                else {
+                    out.push_back(cur);
+                    cur = w;
+                }
+            }
+            i = j;
+        }
+        out.push_back(cur);
+        pos = e + 1;
+    }
+    return out;
+}
+
+static void drawArrow(float x1, float y1, float x2, float y2, float w, Col c) {
+    float dx = x2 - x1, dy = y2 - y1;
+    float L = std::sqrt(dx * dx + dy * dy);
+    if (L < 1) return;
+    float ux = dx / L, uy = dy / L;
+    float head = w * 2.4f;
+    float hx = x2 - ux * head, hy = y2 - uy * head;
+    thickLine(x1, y1, hx, hy, w, c, false);
+    Poly t;
+    t.push_back(P(x2, y2));
+    t.push_back(P(hx - uy * w * 1.5f, hy + ux * w * 1.5f));
+    t.push_back(P(hx + uy * w * 1.5f, hy - ux * w * 1.5f));
+    fillConvex(t, solid(c));
+}
+
+static void lessonSqXY(const LessonLayout &L, int s, float &x, float &y) {
+    int f = s & 7, r = s >> 3;
+    int col = gLWB ? f : 7 - f, row = gLWB ? 7 - r : r;
+    x = L.bx + col * L.cell;
+    y = L.by + row * L.cell;
+}
+static int lessonXYToSq(const LessonLayout &L, float x, float y) {
+    if (x < L.bx || y < L.by || x >= L.bx + L.S || y >= L.by + L.S) return -1;
+    int col = (int)((x - L.bx) / L.cell), row = (int)((y - L.by) / L.cell);
+    if (col < 0 || col > 7 || row < 0 || row > 7) return -1;
+    return gLWB ? (7 - row) * 8 + col : row * 8 + (7 - col);
+}
+
+static float gLScroll = 0, gLScrollStart = 0;
+static bool gLessonDrag = false;
+
+static void drawLearn() {
+    drawBackground();
+    float W = (float)gW, H = (float)gH, U = uiU();
+    int ts = uiTS();
+    float top = H * 0.05f;
+    int tts = fitScale("ОБУЧЕНИЕ", W * 0.9f, ts * 2);
+    text("ОБУЧЕНИЕ", W * 0.5f, top + U * 6, tts, COL_GOLD, 1);
+    int sts = fitScale("ПРАВИЛА, СТРАТЕГИЯ И ЗАДАЧИ", W * 0.9f, std::max(1, ts - 1));
+    text("ПРАВИЛА, СТРАТЕГИЯ И ЗАДАЧИ", W * 0.5f, top + U * 6 + textH(tts) + U * 3, sts, COL_DIM, 1, false);
+    drawButtons(gScreenBtns, gOverlay == OV_NONE);
+    for (auto &b : gScreenBtns) {
+        if (b.id < B_CH0 || b.id >= B_CH0 + NCHAP) continue;
+        int i = b.id - B_CH0;
+        bool pressed = gPressed == b.id && gPtr.down && inRect(b.r, gPtr.x, gPtr.y);
+        float off = pressed ? 1.0f : 0.0f;
+        float r = std::min(b.r.h * 0.3f, U * 4.5f);
+        float cx = b.r.x + U * 3 + r, cy = b.r.y + b.r.h * 0.5f + off;
+        fillCircle(cx, cy, r, C(236, 186, 92));
+        std::string num = std::to_string(i + 1);
+        int ns = std::max(1, (int)(r * 1.1f / 7));
+        text(num, cx, cy - textH(ns) * 0.5f, ns, C(48, 30, 10), 1, false);
+        int np = puzzlesIn(i), sv = solvedIn(i);
+        std::string prog = np ? (std::to_string(sv) + "/" + std::to_string(np)) : "";
+        int pts = std::max(1, ts - 1);
+        float progW = prog.empty() ? 0 : (float)textW(prog, pts) + U * 3;
+        float tx = cx + r + U * 3, tw = b.r.x + b.r.w - tx - progW - U * 3;
+        int t1 = fitScale(CHAPTERS[i].title, tw, ts);
+        int t2 = fitScale(CHAPTERS[i].sub, tw, std::max(1, ts - 2));
+        float gap = U * 1.5f;
+        float total = textH(t1) + gap + textH(t2);
+        float ty = b.r.y + (b.r.h - total) * 0.5f + off;
+        if (total > b.r.h * 0.92f) {  // мало места — только заголовок
+            text(CHAPTERS[i].title, tx, b.r.y + (b.r.h - textH(t1)) * 0.5f + off, t1, COL_TEXT);
+        } else {
+            text(CHAPTERS[i].title, tx, ty, t1, COL_TEXT);
+            text(CHAPTERS[i].sub, tx, ty + textH(t1) + gap, t2, COL_DIM, 0, false);
+        }
+        if (!prog.empty())
+            text(prog, b.r.x + b.r.w - U * 3, cy - textH(pts) * 0.5f, pts,
+                 sv == np ? C(130, 220, 120) : COL_GOLD, 2, false);
+    }
+}
+
+static void drawLesson() {
+    drawBackground();
+    LessonLayout L = lessonLayout();
+    float U = uiU();
+    const LPage &p = curPage();
+    const LChapter &ch = CHAPTERS[gLCh];
+    int hs = std::max(1, L.ts - 1);
+    std::string pg = std::to_string(gLPg + 1) + "/" + std::to_string(ch.n);
+    text(pg, (float)gW - L.pad, L.hdrY, hs, COL_DIM, 2, false);
+    int chs = fitScale(ch.title, gW - 2 * L.pad - textW(pg, hs) - U * 4, hs);
+    text(ch.title, L.pad, L.hdrY, chs, COL_DIM, 0, false);
+    int tts = fitScale(p.title, gW - 2 * L.pad, L.tsT);
+    text(p.title, gW * 0.5f, L.titleY, tts, COL_GOLD, 1);
+
+    // доска
+    float fr = std::max(3.0f, L.cell * 0.09f);
+    fillRRect(L.bx - fr, L.by - fr + 1, L.S + 2 * fr, L.S + 2 * fr, fr * 1.2f, vgrad(C(96, 66, 42), C(58, 38, 24), L.by, L.by + L.S));
+    for (int s = 0; s < 64; s++) {
+        float x, y;
+        lessonSqXY(L, s, x, y);
+        bool light = ((s & 7) + (s >> 3)) & 1;
+        fillRect(x, y, L.cell, L.cell, light ? COL_LIGHT : COL_DARK);
+    }
+    for (auto &m : gLMarks) {
+        if (m.kind != 0) continue;
+        float x, y;
+        lessonSqXY(L, m.a, x, y);
+        Col c = m.c == 'r' ? C(230, 60, 50, 130) : m.c == 'y' ? C(246, 222, 60, 140) : m.c == 'b' ? C(70, 130, 230, 130) : C(80, 190, 80, 130);
+        fillRect(x, y, L.cell, L.cell, c);
+    }
+    if (gLLastFrom >= 0) {
+        float x, y;
+        lessonSqXY(L, gLLastFrom, x, y);
+        fillRect(x, y, L.cell, L.cell, C(246, 222, 60, 95));
+        lessonSqXY(L, gLLastTo, x, y);
+        Col c = gLStatus == 1 ? C(90, 200, 90, 150) : gLStatus == 2 ? C(230, 70, 60, 150) : C(246, 222, 60, 125);
+        fillRect(x, y, L.cell, L.cell, c);
+    }
+    if (gLSel >= 0) {
+        float x, y;
+        lessonSqXY(L, gLSel, x, y);
+        fillRect(x, y, L.cell, L.cell, C(92, 178, 92, 150));
+    }
+    if (gLB.inCheck(gLB.side)) {
+        float x, y;
+        lessonSqXY(L, gLB.kingSq[gLB.side], x, y);
+        radial(x + L.cell * 0.5f, y + L.cell * 0.5f, L.cell * 0.62f, C(255, 30, 20, 230), C(255, 30, 20, 0));
+    }
+    int cs = std::max(1, (int)(L.cell / 30.0f));
+    for (int i = 0; i < 8; i++) {
+        int file = gLWB ? i : 7 - i, rank = gLWB ? 7 - i : i;
+        std::string fs(1, (char)('a' + file)), rs(1, (char)('1' + rank));
+        bool lf = ((file + (gLWB ? 0 : 7)) & 1) != 0;
+        text(fs, L.bx + i * L.cell + L.cell - textW(fs, cs) - cs * 1.5f, L.by + 8 * L.cell - textH(cs) - cs * 1.2f, cs,
+             lf ? COL_DARK : COL_LIGHT, 0, false);
+        bool lr = ((rank + (gLWB ? 0 : 7)) & 1) != 0;
+        text(rs, L.bx + cs * 1.5f, L.by + i * L.cell + cs * 1.2f, cs, lr ? COL_DARK : COL_LIGHT, 0, false);
+    }
+    for (int s = 0; s < 64; s++) {
+        if (!gLB.sq[s]) continue;
+        float x, y;
+        lessonSqXY(L, s, x, y);
+        drawPiece(gLB.sq[s], x, y, L.cell);
+    }
+    for (auto m : gLTargets) {
+        int t = eng::mTo(m);
+        float x, y;
+        lessonSqXY(L, t, x, y);
+        float cx = x + L.cell * 0.5f, cy = y + L.cell * 0.5f;
+        if (gLB.sq[t] || (eng::mFlags(m) & eng::F_EP)) ringShape(cx, cy, L.cell * 0.40f, L.cell * 0.49f, C(20, 60, 20, 95));
+        else fillCircle(cx, cy, L.cell * 0.16f, C(20, 60, 20, 90));
+    }
+    float aw = std::max(3.0f, L.cell * 0.16f);
+    for (auto &m : gLMarks) {
+        if (m.kind != 1) continue;
+        float x0, y0, x1, y1;
+        lessonSqXY(L, m.a, x0, y0);
+        lessonSqXY(L, m.b, x1, y1);
+        drawArrow(x0 + L.cell * 0.5f, y0 + L.cell * 0.5f, x1 + L.cell * 0.5f, y1 + L.cell * 0.5f, aw, C(40, 160, 60, 170));
+    }
+    if (p.mode == LM_PUZZLE && gLShowHint && gLHint && gLStatus != 1) {
+        float x0, y0, x1, y1;
+        lessonSqXY(L, eng::mFrom(gLHint), x0, y0);
+        lessonSqXY(L, eng::mTo(gLHint), x1, y1);
+        drawArrow(x0 + L.cell * 0.5f, y0 + L.cell * 0.5f, x1 + L.cell * 0.5f, y1 + L.cell * 0.5f, aw, C(236, 160, 40, 190));
+    }
+
+    // строка состояния
+    if (p.mode != LM_SHOW) {
+        std::string st;
+        Col sc = COL_DIM;
+        if (p.mode == LM_MOVES) {
+            st = "НАЖИМАЙТЕ НА ТОЧКИ, ЧТОБЫ ПОХОДИТЬ";
+        } else if (gLStatus == 1) {
+            st = "ВЕРНО! ОТЛИЧНО!";
+            sc = C(130, 226, 120);
+        } else if (gLStatus == 2) {
+            st = "НЕ ТО. ПОПРОБУЙТЕ ЕЩЁ РАЗ";
+            sc = C(240, 110, 96);
+        } else if (gLShowHint) {
+            st = "ПОДСКАЗКА: СМОТРИТЕ НА СТРЕЛКУ";
+            sc = COL_GOLD;
+        } else {
+            st = std::string(strcmp(p.sol, "#") == 0 ? "МАТ В 1 ХОД. " : "") + "ХОД " +
+                 (gLB.side == eng::WHITE ? "БЕЛЫХ" : "ЧЁРНЫХ");
+            sc = COL_GOLD;
+        }
+        int ss = fitScale(st, gW - 2 * L.pad, L.ts);
+        text(st, gW * 0.5f, L.statusY, ss, sc, 1);
+    }
+
+    // текст урока с прокруткой
+    fillRRect(L.textX, L.textY, L.textW, L.textH, U * 2.2f, C(22, 28, 40, 220));
+    float ip = U * 3;
+    auto lines = wrapText(p.text, L.tsB, L.textW - 2 * ip);
+    float lh = textH(L.tsB) + U * 2.4f;
+    float total = lines.size() * lh + 2 * ip - U * 2.4f;
+    float maxS = std::max(0.0f, total - L.textH);
+    if (gLScroll > maxS) gLScroll = maxS;
+    if (gLScroll < 0) gLScroll = 0;
+    SDL_Rect clip;
+    clip.x = (int)L.textX;
+    clip.y = (int)L.textY;
+    clip.w = (int)L.textW;
+    clip.h = (int)std::max(1.0f, L.textH);
+    SDL_RenderSetClipRect(R, &clip);
+    float y = L.textY + ip - gLScroll;
+    for (auto &ln : lines) {
+        if (y + lh > L.textY && y < L.textY + L.textH) text(ln, L.textX + ip, y, L.tsB, COL_TEXT, 0, false);
+        y += lh;
+    }
+    SDL_RenderSetClipRect(R, nullptr);
+    if (maxS > 0) {
+        float th = std::max(U * 5, L.textH * L.textH / total);
+        float tp = gLScroll / maxS;
+        fillRRect(L.textX + L.textW - U * 1.6f, L.textY + (L.textH - th) * tp, U * 0.8f, th, U * 0.4f, C(255, 255, 255, 70));
+    }
+    drawButtons(gScreenBtns, gOverlay == OV_NONE);
+}
+
+// ---------- игра по сети: экраны ----------
+static void drawWaitDots(float x, float y, float U) {
+    Uint32 t = SDL_GetTicks();
+    for (int i = 0; i < 3; i++) {
+        float ph = std::sin((t / 160.0f) - i * 0.9f) * 0.5f + 0.5f;
+        fillCircle(x + i * U * 3.0f, y, U * (0.6f + 0.5f * ph), withA(COL_GOLD, (int)(110 + 145 * ph)));
+    }
+}
+
+static void drawTextBlock(const std::string &s, float x, float y, float w, int sc, Col c, int align) {
+    auto lines = wrapText(s, sc, w);
+    float lh = textH(sc) + uiU() * 2.2f;
+    for (auto &ln : lines) {
+        text(ln, align == 1 ? x + w * 0.5f : x, y, sc, c, align, false);
+        y += lh;
+    }
+}
+
+static void drawNet() {
+    drawBackground();
+    float W = (float)gW, H = (float)gH, U = uiU();
+    int ts = uiTS();
+    float top = H * 0.05f;
+    int tts = fitScale("ИГРА ПО СЕТИ", W * 0.9f, ts * 2);
+    text("ИГРА ПО СЕТИ", W * 0.5f, top + U * 6, tts, COL_GOLD, 1);
+    float bw = std::min(W * 0.9f, U * 90.0f), x = (W - bw) * 0.5f;
+    float sy = top + U * 6 + textH(tts) + U * 3;
+    int sm = std::max(1, ts - 1);
+    float y = top + U * 30;
+    if (gNetUI == NU_MENU) {
+        drawTextBlock("ОБА ТЕЛЕФОНА ДОЛЖНЫ БЫТЬ В ОДНОЙ СЕТИ ВАЙ-ФАЙ ИЛИ ОДИН РАЗДАЁТ ТОЧКУ ДОСТУПА ДРУГОМУ", x, sy, bw, sm, COL_DIM, 1);
+        text("ВАШ ЦВЕТ", x, y, ts, COL_TEXT);
+        float bh = std::max(36.0f, U * 12.5f);
+        y += textH(ts) + U * 3 + bh * 1.35f + U * 7;
+        text("ЧАСЫ (НА КАЖДОГО)", x, y, ts, COL_TEXT);
+    } else if (gNetUI == NU_WAIT) {
+        text("ОЖИДАНИЕ СОПЕРНИКА", W * 0.5f, y, ts + 1, COL_TEXT, 1);
+        drawWaitDots(W * 0.5f - U * 3, y + textH(ts + 1) + U * 5, U);
+        y += textH(ts + 1) + U * 12;
+        text("ВАШ АДРЕС В СЕТИ:", W * 0.5f, y, sm, COL_DIM, 1, false);
+        y += textH(sm) + U * 3;
+        std::string ip = gNet.myIp.empty() ? "НЕ ОПРЕДЕЛЁН" : gNet.myIp;
+        int is = fitScale(ip, bw, ts * 2);
+        text(ip, W * 0.5f, y, is, COL_GOLD, 1);
+        y += textH(is) + U * 8;
+        drawTextBlock("НА ВТОРОМ ТЕЛЕФОНЕ ОТКРОЙТЕ: ПО СЕТИ - ПОДКЛЮЧИТЬСЯ. ИГРА НАЙДЁТСЯ САМА, ИЛИ ВВЕДИТЕ ЭТОТ АДРЕС ВРУЧНУЮ.",
+                      x, y, bw, sm, COL_TEXT, 1);
+    } else if (gNetUI == NU_JOIN) {
+        text("ПОИСК ИГР В СЕТИ", W * 0.5f, top + U * 24, ts + 1, COL_TEXT, 1);
+        drawWaitDots(W * 0.5f + textW("ПОИСК ИГР В СЕТИ", ts + 1) * 0.5f + U * 3, top + U * 24 + textH(ts + 1) * 0.5f, U);
+        if (gFound.empty())
+            drawTextBlock("ПОКА НИЧЕГО НЕ НАЙДЕНО. СОЗДАЙТЕ ИГРУ НА ВТОРОМ ТЕЛЕФОНЕ. ЕСЛИ ОНА НЕ ПОЯВЛЯЕТСЯ, ВВЕДИТЕ АДРЕС ВРУЧНУЮ.",
+                          x, top + U * 36, bw, sm, COL_DIM, 1);
+    } else if (gNetUI == NU_KEYPAD) {
+        text("АДРЕС ИГРЫ", W * 0.5f, top + U * 22, ts, COL_TEXT, 1);
+        float fy = top + U * 30, fh = U * 14;
+        fillRRect(x, fy, bw, fh, U * 2.5f, C(22, 28, 40, 240));
+        fillRRect(x, fy + fh - U * 0.6f, bw, U * 0.6f, 0, COL_GOLD);
+        if (gNetIpInput.empty()) {
+            int ps = fitScale("НАПРИМЕР 192.168.1.5", bw * 0.9f, ts);
+            text("НАПРИМЕР 192.168.1.5", W * 0.5f, fy + (fh - textH(ps)) * 0.5f, ps, C(110, 118, 132), 1, false);
+        } else {
+            int is = fitScale(gNetIpInput, bw * 0.9f, ts + 2);
+            text(gNetIpInput, W * 0.5f, fy + (fh - textH(is)) * 0.5f, is, COL_GOLD, 1);
+        }
+    } else if (gNetUI == NU_CONNECTING) {
+        text("ПОДКЛЮЧЕНИЕ", W * 0.5f, y, ts + 1, COL_TEXT, 1);
+        drawWaitDots(W * 0.5f - U * 3, y + textH(ts + 1) + U * 5, U);
+        int is = fitScale(gNet.peerIp, bw, ts + 2);
+        text(gNet.peerIp, W * 0.5f, y + textH(ts + 1) + U * 12, is, COL_GOLD, 1);
+    }
+    if (!gNetMsg.empty() && gNetUI != NU_WAIT && gNetUI != NU_CONNECTING) {
+        float bh2 = std::max(40.0f, U * 14.0f);
+        float my = H - U * 6 - bh2 - (gNetUI == NU_MENU ? 2 : 1) * (bh2 + U * 3) - textH(ts) - U * 4;
+        int ms = fitScale(gNetMsg, bw, ts);
+        text(gNetMsg, W * 0.5f, my, ms, C(240, 110, 96), 1);
+    }
+    drawButtons(gScreenBtns, gOverlay == OV_NONE);
+}
+
+static void drawToast() {
+    if (gToast.empty() || SDL_GetTicks() > gToastUntil) return;
+    float U = uiU();
+    int ts = uiTS();
+    int sc = fitScale(gToast, gW * 0.85f, ts);
+    float w = textW(gToast, sc) + U * 8, h = textH(sc) + U * 6;
+    float x = (gW - w) * 0.5f, y = gH * 0.80f - h;
+    fillRRect(x, y + U * 0.6f, w, h, h * 0.5f, C(0, 0, 0, 110));
+    fillRRect(x, y, w, h, h * 0.5f, C(236, 230, 214, 245));
+    text(gToast, gW * 0.5f, y + (h - textH(sc)) * 0.5f, sc, C(30, 30, 34), 1, false);
+}
+
 // ---------- окна поверх ----------
 static void drawPanel(const Panel &p) {
     float U = uiU();
@@ -3205,6 +4661,8 @@ static std::string reasonText() {
         case R_FIFTY: return "ПРАВИЛО 50 ХОДОВ";
         case R_REPEAT: return "ТРОЕКРАТНОЕ ПОВТОРЕНИЕ";
         case R_MATERIAL: return "НЕДОСТАТОЧНО МАТЕРИАЛА";
+        case R_AGREE: return "ПО СОГЛАСИЮ";
+        case R_LEFT: return "СОПЕРНИК ПОКИНУЛ ИГРУ";
         default: return "";
     }
 }
@@ -3219,7 +4677,12 @@ static void drawOverlay() {
         drawPanel(p);
         std::string q1, q2;
         if (gConfirm == CF_RESIGN) { q1 = "СДАТЬСЯ?"; q2 = "ПАРТИЯ БУДЕТ ПРОИГРАНА"; }
+        else if (gConfirm == CF_NEW && gM.mode == MODE_NET) { q1 = "НОВАЯ ПАРТИЯ?"; q2 = "ПРЕДЛОЖИТЬ СОПЕРНИКУ НАЧАТЬ ЗАНОВО"; }
         else if (gConfirm == CF_NEW) { q1 = "НОВАЯ ПАРТИЯ?"; q2 = "ТЕКУЩАЯ ПАРТИЯ НЕ ЗАВЕРШЕНА"; }
+        else if (gConfirm == CF_NET_DRAW) { q1 = "НИЧЬЯ?"; q2 = "СОПЕРНИК ПРЕДЛАГАЕТ НИЧЬЮ"; }
+        else if (gConfirm == CF_NET_NEW) { q1 = "НОВАЯ ПАРТИЯ?"; q2 = "СОПЕРНИК ПРЕДЛАГАЕТ СЫГРАТЬ ЕЩЁ"; }
+        else if (gConfirm == CF_NET_LEAVE) { q1 = "ПОКИНУТЬ ИГРУ?"; q2 = "ВАМ БУДЕТ ЗАСЧИТАНО ПОРАЖЕНИЕ"; }
+        else if (gConfirm == CF_NET_LOST) { q1 = "СВЯЗЬ ПОТЕРЯНА"; q2 = "СОПЕРНИК НЕ ОТВЕЧАЕТ, ПАРТИЯ ПРЕРВАНА"; }
         else { q1 = "СБРОСИТЬ?"; q2 = "ВСЯ СТАТИСТИКА БУДЕТ УДАЛЕНА"; }
         int s1 = fitScale(q1, p.w * 0.9f, ts + 2), s2 = fitScale(q2, p.w * 0.9f, ts);
         text(q1, p.x + p.w * 0.5f, p.y + U * 8, s1, COL_GOLD, 1);
@@ -3232,7 +4695,7 @@ static void drawOverlay() {
         Col tc = COL_GOLD;
         int winner = g.result == RES_WHITE ? eng::WHITE : (g.result == RES_BLACK ? eng::BLACK : -1);
         if (g.result == RES_DRAW) t1 = "НИЧЬЯ";
-        else if (gM.mode == MODE_BOT) {
+        else if (gM.mode != MODE_TWO) {
             if (winner == gM.human) { t1 = "ПОБЕДА!"; tc = C(140, 226, 130); }
             else { t1 = "ПОРАЖЕНИЕ"; tc = C(236, 120, 106); }
         } else {
@@ -3270,26 +4733,72 @@ static void render() {
     SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(R, 12, 15, 22, 255);
     SDL_RenderClear(R);
-    if (gScreen != SC_GAME) ensurePieceTex(std::max(24, (int)(uiU() * 13)));
+    ensurePieceTex((int)gameLayout().cell);  // один размер текстур фигур для всех экранов
     switch (gScreen) {
         case SC_MENU: drawMenu(); break;
         case SC_SETUP: drawSetup(); break;
         case SC_STATS: drawStats(); break;
+        case SC_LEARN: drawLearn(); break;
+        case SC_LESSON: drawLesson(); break;
+        case SC_NET: drawNet(); break;
         case SC_GAME: drawGame(); break;
     }
     drawOverlay();
+    drawToast();
 }
 
 // =====================================================================
 //                              ВВОД
 // =====================================================================
 static void goMenu() {
+    if (gM.mode == MODE_NET) netLeave(true);
     cancelBot();
     clearSel();
     gOverlay = OV_NONE;
     gResultPending = false;
     gScreen = SC_MENU;
     saveAll();
+}
+
+static void netCancel() {
+    gNetMsg.clear();
+    switch (gNetUI) {
+        case NU_WAIT: netCloseAll(); gNetUI = NU_MENU; break;
+        case NU_CONNECTING: netCloseAll(); netScanStart(); gNetUI = NU_JOIN; break;
+        case NU_JOIN: netCloseAll(); gNetUI = NU_MENU; break;
+        case NU_KEYPAD: netScanStart(); gNetUI = NU_JOIN; break;
+        default: netCloseAll(); gScreen = SC_MENU; break;
+    }
+}
+
+// Закрыть окно подтверждения «нет»; на предложение соперника — отказ
+static void confirmCancel() {
+    if (gConfirm == CF_NET_DRAW || gConfirm == CF_NET_NEW) netSendLine("DECLINE");
+    gOverlay = OV_NONE;
+    gConfirm = CF_NONE;
+}
+
+static void netJoinIp(const std::string &ip) {
+    if (!validIp(ip)) {
+        gNetMsg = "НЕВЕРНЫЙ АДРЕС";
+        return;
+    }
+    if (netConnect(ip)) {
+        gNetMsg.clear();
+        gNetUI = NU_CONNECTING;
+    } else {
+        gNetMsg = "НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ";
+    }
+}
+
+static void leaveGameAsk() {
+    if (gM.mode == MODE_NET && gM.g.result == RES_NONE && netConnected() && !gM.g.moves.empty()) {
+        gConfirm = CF_NET_LEAVE;
+        gOverlay = OV_CONFIRM;
+        clearSel();
+    } else {
+        goMenu();
+    }
 }
 
 static void onButton(int id) {
@@ -3311,26 +4820,98 @@ static void onButton(int id) {
         case B_COL_W: case B_COL_B: case B_COL_R: gSet.color = id - B_COL_W; saveAll(); break;
         case B_CLK0: case B_CLK1: case B_CLK2: case B_CLK3: gSet.clock = id - B_CLK0; saveAll(); break;
         case B_START: newMatch(gSetupMode, gSet.level, gSetupMode == MODE_BOT ? gSet.color : 0, gSet.clock); break;
-        case B_BACK: gScreen = SC_MENU; break;
+        case B_BACK:
+            if (gScreen == SC_NET) netCloseAll();
+            gScreen = SC_MENU;
+            break;
         case B_UNDO: doUndo(); break;
         case B_RESIGN: gConfirm = CF_RESIGN; gOverlay = OV_CONFIRM; clearSel(); break;
         case B_NEW:
-            if (gM.g.result == RES_NONE && !gM.g.moves.empty()) { gConfirm = CF_NEW; gOverlay = OV_CONFIRM; clearSel(); }
+            if (gM.mode == MODE_NET && !netConnected()) toast("НЕТ СВЯЗИ С СОПЕРНИКОМ");
+            else if (gM.g.result == RES_NONE && !gM.g.moves.empty()) { gConfirm = CF_NEW; gOverlay = OV_CONFIRM; clearSel(); }
+            else if (gM.mode == MODE_NET) netOffer("NEW");
             else restartSame();
             break;
+        case B_DRAW: netOffer("DRAW"); break;
+        case B_PLAY_NET:
+            gScreen = SC_NET;
+            gNetUI = NU_MENU;
+            gNetMsg.clear();
+            break;
+        case B_NET_HOST:
+            gNetMsg.clear();
+            if (netHost()) gNetUI = NU_WAIT;
+            else gNetMsg = "НЕ УДАЛОСЬ СОЗДАТЬ ИГРУ";
+            break;
+        case B_NET_JOIN:
+            netCloseAll();
+            netScanStart();
+            gNetMsg.clear();
+            gNetUI = NU_JOIN;
+            break;
+        case B_NET_CANCEL: netCancel(); break;
+        case B_NET_MANUAL:
+            if (gNetIpInput.empty()) gNetIpInput = gNetLastIp;
+            gNetMsg.clear();
+            gNetUI = NU_KEYPAD;
+            break;
+        case B_KEY0: case B_KEY1: case B_KEY2: case B_KEY3: case B_KEY4:
+        case B_KEY5: case B_KEY6: case B_KEY7: case B_KEY8: case B_KEY9:
+            if (gNetIpInput.size() < 15) gNetIpInput += (char)('0' + (id - B_KEY0));
+            gNetMsg.clear();
+            break;
+        case B_KEY_DOT:
+            if (gNetIpInput.size() < 15) gNetIpInput += '.';
+            break;
+        case B_KEY_DEL:
+            if (!gNetIpInput.empty()) gNetIpInput.pop_back();
+            break;
+        case B_NET_GO:
+            if (validIp(gNetIpInput)) {
+                gNetLastIp = gNetIpInput;
+                saveAll();
+            }
+            netJoinIp(gNetIpInput);
+            break;
+        case B_FOUND0: case B_FOUND1: case B_FOUND2: case B_FOUND3: case B_FOUND4: case B_FOUND5: {
+            size_t i = (size_t)(id - B_FOUND0);
+            if (i < gFound.size()) netJoinIp(gFound[i].ip);
+            break;
+        }
         case B_FLIP: gM.flip = !gM.flip; saveAll(); break;
-        case B_MENU: goMenu(); break;
+        case B_MENU: leaveGameAsk(); break;
         case B_YES: {
             int c = gConfirm;
             gOverlay = OV_NONE;
             gConfirm = CF_NONE;
             if (c == CF_RESIGN) doResign();
+            else if (c == CF_NEW && gM.mode == MODE_NET) netOffer("NEW");
             else if (c == CF_NEW) restartSame();
+            else if (c == CF_NET_DRAW) {
+                netSendLine("ACCEPT DRAW");
+                if (gM.g.result == RES_NONE) {
+                    gM.g.result = RES_DRAW;
+                    gM.g.reason = R_AGREE;
+                    onGameEnd();
+                }
+            } else if (c == CF_NET_NEW) {
+                netSendLine("ACCEPT NEW");
+                startNetMatch(gM.human ^ 1, gM.clockInit);
+            } else if (c == CF_NET_LEAVE) {
+                doResign();
+                goMenu();
+            } else if (c == CF_NET_LOST) {
+                goMenu();
+            }
             else if (c == CF_RESET) { gStats = Stats(); saveAll(); }
             break;
         }
-        case B_NO: gOverlay = OV_NONE; gConfirm = CF_NONE; break;
-        case B_RES_NEW: gOverlay = OV_NONE; restartSame(); break;
+        case B_NO: confirmCancel(); break;
+        case B_RES_NEW:
+            gOverlay = OV_NONE;
+            if (gM.mode == MODE_NET) netOffer("NEW");
+            else restartSame();
+            break;
         case B_RES_VIEW: gOverlay = OV_NONE; break;
         case B_RES_MENU: gOverlay = OV_NONE; goMenu(); break;
         case B_PROMO_Q: case B_PROMO_R: case B_PROMO_B: case B_PROMO_N: {
@@ -3345,20 +4926,44 @@ static void onButton(int id) {
             break;
         }
         case B_RESET: gConfirm = CF_RESET; gOverlay = OV_CONFIRM; break;
-        default: break;
+        case B_LEARN: gScreen = SC_LEARN; break;
+        case B_L_PREV:
+            if (gLPg > 0) { openLesson(gLCh, gLPg - 1); gLScroll = 0; }
+            break;
+        case B_L_NEXT:
+            if (gLPg < CHAPTERS[gLCh].n - 1) openLesson(gLCh, gLPg + 1);
+            else if (gLCh < NCHAP - 1) openLesson(gLCh + 1, 0);
+            else gScreen = SC_LEARN;
+            gLScroll = 0;
+            break;
+        case B_L_MID: {
+            int md = curPage().mode;
+            if (md == LM_SHOW) gScreen = SC_LEARN;
+            else if (md == LM_MOVES || gLStatus == 1) loadLessonPage(true);
+            else gLShowHint = true;
+            break;
+        }
+        default:
+            if (id >= B_CH0 && id < B_CH0 + NCHAP) {
+                openLesson(id - B_CH0, 0);
+                gLScroll = 0;
+                gScreen = SC_LESSON;
+            }
+            break;
     }
 }
 
 static void onBack() {
     if (gOverlay != OV_NONE) {
         if (gOverlay == OV_PROMO) clearSel();
-        gOverlay = OV_NONE;
-        gConfirm = CF_NONE;
+        confirmCancel();
         return;
     }
     switch (gScreen) {
-        case SC_GAME: goMenu(); break;
-        case SC_SETUP: case SC_STATS: gScreen = SC_MENU; break;
+        case SC_GAME: leaveGameAsk(); break;
+        case SC_NET: netCancel(); break;
+        case SC_SETUP: case SC_STATS: case SC_LEARN: gScreen = SC_MENU; break;
+        case SC_LESSON: gScreen = SC_LEARN; break;
         default: gRunning = false; break;
     }
 }
@@ -3379,6 +4984,16 @@ static void pointerDown(float x, float y) {
         }
     if (gOverlay != OV_NONE) {
         gPtr.outside = true;
+        return;
+    }
+    if (gScreen == SC_LESSON) {
+        LessonLayout LL = lessonLayout();
+        int ls = lessonXYToSq(LL, x, y);
+        if (ls >= 0) lessonTap(ls);
+        else if (x >= LL.textX && x < LL.textX + LL.textW && y >= LL.textY && y < LL.textY + LL.textH) {
+            gLessonDrag = true;
+            gLScrollStart = gLScroll;
+        }
         return;
     }
     if (gScreen != SC_GAME) return;
@@ -3413,6 +5028,11 @@ static void pointerMove(float x, float y) {
     gPtr.x = x;
     gPtr.y = y;
     if (!gPtr.down) return;
+    if (gLessonDrag) {
+        gLScroll = gLScrollStart - (y - gPtr.sy);
+        if (gLScroll < 0) gLScroll = 0;
+        return;
+    }
     if (gPtr.listDrag) {
         GameLayout L = gameLayout();
         float lineH = textH(L.tsSmall) + uiU() * 2.2f;
@@ -3444,9 +5064,10 @@ static void pointerUp(float x, float y) {
     if (gPtr.outside) {
         gPtr.outside = false;
         if (gOverlay == OV_PROMO) { gOverlay = OV_NONE; clearSel(); }
-        else if (gOverlay == OV_CONFIRM) { gOverlay = OV_NONE; gConfirm = CF_NONE; }
+        else if (gOverlay == OV_CONFIRM) confirmCancel();
         return;
     }
+    if (gLessonDrag) { gLessonDrag = false; return; }
     if (gPtr.listDrag) { gPtr.listDrag = false; return; }
     if (gScreen == SC_GAME && gDrag.active) {
         gDrag.active = false;
@@ -3551,6 +5172,7 @@ static void handleEvent(const SDL_Event &e) {
 }
 
 static void update() {
+    netPoll();
     Uint32 now = SDL_GetTicks();
     Uint32 dt = now - gLastTick;
     gLastTick = now;
@@ -3570,20 +5192,35 @@ static void update() {
         // часы
         if (gM.clockInit > 0 && gM.g.result == RES_NONE && !gPaused && !gM.g.moves.empty()) {
             int side = gM.g.cur.side;
-            gM.tLeft[side] -= dt;
-            if (gM.tLeft[side] <= 0) onTimeout(side);
+            if (gM.mode == MODE_NET) {
+                // свои часы решают сами; чужим даём запас на задержку сети
+                if (netConnected()) {
+                    gM.tLeft[side] -= dt;
+                    if (side == gM.human && gM.tLeft[side] <= 0) {
+                        netSendLine("TIMEOUT");
+                        onTimeout(side);
+                    } else if (side != gM.human && gM.tLeft[side] <= -8000) {
+                        onTimeout(side);
+                    }
+                }
+            } else {
+                gM.tLeft[side] -= dt;
+                if (gM.tLeft[side] <= 0) onTimeout(side);
+            }
         }
         if (gResultPending && gAnims.empty() && now >= gResultAt) {
             gResultPending = false;
             if (gScreen == SC_GAME && gM.g.result != RES_NONE) gOverlay = OV_RESULT;
         }
     }
+    if (gScreen == SC_LESSON && gLResetAt && now >= gLResetAt) loadLessonPage(false);
     buildScreenButtons();
     buildOverlayButtons();
 }
 
 static bool needsAnimation() {
-    if (gPtr.down || !gAnims.empty() || botThinking() || gResultPending) return true;
+    if (gPtr.down || !gAnims.empty() || botThinking() || gResultPending || gLResetAt) return true;
+    if (gScreen == SC_NET || SDL_GetTicks() < gToastUntil) return true;
     if (gScreen == SC_GAME && gM.clockInit > 0 && gM.g.result == RES_NONE && !gM.g.moves.empty()) return true;
     return false;
 }
@@ -3737,7 +5374,7 @@ static bool appInit() {
 static void appFrame() {
     SDL_Event e;
     if (!needsAnimation() && gDirty <= 0 && !gPaused) {
-        if (SDL_WaitEventTimeout(&e, 500)) {
+        if (SDL_WaitEventTimeout(&e, netBusy() ? 30 : 500)) {
             SDL_LockMutex(gLock);
             handleEvent(e);
             SDL_UnlockMutex(gLock);
@@ -3751,6 +5388,7 @@ static void appFrame() {
     if (gPaused) {
         SDL_LockMutex(gLock);
         gLastTick = SDL_GetTicks();
+        netPoll();  // держим соединение, пока приложение свёрнуто
         SDL_UnlockMutex(gLock);
         if (SDL_WaitEventTimeout(&e, 200)) {
             SDL_LockMutex(gLock);
@@ -3771,6 +5409,8 @@ static void appFrame() {
 
 static void appQuit() {
     cancelBot();
+    if (gM.mode == MODE_NET) netLeave(true);
+    netCloseAll();
     saveAll();
     if (gAudioOk) SDL_CloseAudio();
     freePieceTex();
