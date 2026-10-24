@@ -3461,12 +3461,24 @@ static void pointerUp(float x, float y) {
     }
 }
 
+// Размер окна (SDL_GetWindowSize) и реальная область рисования на некоторых
+// телефонах отличаются (строка состояния, вырез камеры). Рисуем и пересчитываем
+// касания по реальной области рисования, иначе нажатие «съезжает».
+static float gMouseSX = 1.0f, gMouseSY = 1.0f;  // окно -> пиксели рисования (для мыши)
 static void updateSize() {
     int w = 0, h = 0;
     SDL_GetWindowSize(gWin, &w, &h);
-    if (w > 0 && h > 0) {
+    int ow = 0, oh = 0;
+    if (R && SDL_GetRendererOutputSize(R, &ow, &oh) == 0 && ow > 0 && oh > 0) {
+        if (ow != gW || oh != gH) gTexDirty = true;
+        gW = ow;
+        gH = oh;
+        gMouseSX = w > 0 ? (float)ow / w : 1.0f;
+        gMouseSY = h > 0 ? (float)oh / h : 1.0f;
+    } else if (w > 0 && h > 0) {
         gW = w;
         gH = h;
+        gMouseSX = gMouseSY = 1.0f;
     }
 }
 
@@ -3519,16 +3531,16 @@ static void handleEvent(const SDL_Event &e) {
             if (e.button.which == SDL_TOUCH_MOUSEID || e.button.button != SDL_BUTTON_LEFT) break;
             if (!gPtr.down) {
                 gPtr.finger = false;
-                pointerDown((float)e.button.x, (float)e.button.y);
+                pointerDown(e.button.x * gMouseSX, e.button.y * gMouseSY);
             }
             break;
         case SDL_MOUSEMOTION:
             if (e.motion.which == SDL_TOUCH_MOUSEID) break;
-            if (!gPtr.finger || !gPtr.down) pointerMove((float)e.motion.x, (float)e.motion.y);
+            if (!gPtr.finger || !gPtr.down) pointerMove(e.motion.x * gMouseSX, e.motion.y * gMouseSY);
             break;
         case SDL_MOUSEBUTTONUP:
             if (e.button.which == SDL_TOUCH_MOUSEID || e.button.button != SDL_BUTTON_LEFT) break;
-            if (gPtr.down && !gPtr.finger) pointerUp((float)e.button.x, (float)e.button.y);
+            if (gPtr.down && !gPtr.finger) pointerUp(e.button.x * gMouseSX, e.button.y * gMouseSY);
             break;
         case SDL_MOUSEWHEEL:
             if (gScreen == SC_GAME) gListScroll += e.wheel.y > 0 ? 1 : (e.wheel.y < 0 ? -1 : 0);
@@ -3748,6 +3760,8 @@ static void appFrame() {
         return;
     }
     SDL_LockMutex(gLock);
+    updateSize();  // размер мог поменяться (поворот, строка состояния, вырез)
+    SDL_RenderSetViewport(R, nullptr);
     update();
     render();
     SDL_UnlockMutex(gLock);
