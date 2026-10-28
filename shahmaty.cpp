@@ -830,10 +830,18 @@ struct Searcher {
     bool aborted = false;
     std::atomic<bool> *stopFlag = nullptr;
     Move rootBest = 0;
+    TTE *tt = nullptr;  // своя таблица у каждого потока анализа
+    uint64_t ttMask = 0;
+    TTE ttDummy;
 
     Searcher() {
         memset(killers, 0, sizeof(killers));
         memset(hist, 0, sizeof(hist));
+        memset(&ttDummy, 0, sizeof(ttDummy));
+        if (!g_tt.empty()) {
+            tt = g_tt.data();
+            ttMask = g_ttMask;
+        }
     }
 
     void checkTime() {
@@ -932,7 +940,7 @@ struct Searcher {
         if (depth <= 0) return quiesce(alpha, beta, ply);
         if (ply >= MAXPLY - 1) return evaluate(b);
 
-        TTE &e = g_tt[b.hash & g_ttMask];
+        TTE &e = tt ? tt[b.hash & ttMask] : ttDummy;
         Move ttMove = 0;
         if (e.key == b.hash) {
             ttMove = e.move;
@@ -1123,36 +1131,90 @@ static Move think(const Board &rb, const std::vector<uint64_t> &hist, int level,
     return res;
 }
 
-// Оценка позиции для разбора: счёт с точки зрения того, кто ходит, и лучший ход
-static int analyse(const Board &rb, const std::vector<uint64_t> &hist, Uint32 timeMs, int maxDepth,
-                   std::atomic<bool> *stop, Move *best) {
+// Разбор хода: лучший ход и сыгранный ход оцениваются из одной позиции
+// на ОДНОЙ И ТОЙ ЖЕ глубине — так сравнение честное, без «шума» разной глубины.
+struct TTBuf {
+    std::vector<TTE> v;
+    uint64_t mask = 0;
+    void init(int bits) {
+        TTE z;
+        memset(&z, 0, sizeof(z));
+        v.assign((size_t)1 << bits, z);
+        mask = ((uint64_t)1 << bits) - 1;
+    }
+};
+struct MoveVerdict {
+    int best = 0;      // оценка лучшего хода (с точки зрения ходящего)
+    int played = 0;    // оценка сыгранного хода (с той же точки зрения)
+    int depth = 0;     // глубина, на которой сравнивали
+    Move bestMove = 0;
+    int legal = 0;     // сколько было ходов (1 — вынужденный)
+};
+static MoveVerdict analyseMove(const Board &pos, const std::vector<uint64_t> &hist, Move played, Uint32 timeMs,
+                               std::atomic<bool> *stop, TTBuf *buf) {
+    MoveVerdict r;
     Searcher *S = new Searcher();
-    S->b = rb;
+    if (buf) {
+        S->tt = buf->v.data();
+        S->ttMask = buf->mask;
+    }
+    S->b = pos;
     S->path = hist;
-    if (S->path.empty() || S->path.back() != rb.hash) S->path.push_back(rb.hash);
+    if (S->path.empty() || S->path.back() != pos.hash) S->path.push_back(pos.hash);
     S->stopFlag = stop;
     S->start = SDL_GetTicks();
     S->limit = timeMs;
     MoveList ml;
     S->b.genLegal(ml);
-    int score = 0;
-    Move bm = 0;
+    r.legal = ml.n;
     if (ml.n == 0) {
-        score = S->b.inCheck(S->b.side) ? -MATE : 0;
+        r.best = r.played = S->b.inCheck(S->b.side) ? -MATE : 0;
+        delete S;
+        return r;
+    }
+    Move bm = ml.m[0];
+    int bs = 0, depth = 0;
+    for (int d = 1; d <= MAXPLY - 8; d++) {
+        S->rootBest = 0;
+        int sc = S->negamax(d, -INF, INF, 0, false);
+        if (S->aborted) break;
+        bs = sc;
+        depth = d;
+        if (S->rootBest) bm = S->rootBest;
+        if (std::abs(sc) > MATE - 100) break;
+    }
+    if (depth == 0) {  // не успели даже глубину 1 — хотя бы статическая оценка
+        bs = evaluate(S->b);
+        depth = 1;
+    }
+    r.best = bs;
+    r.bestMove = bm;
+    r.depth = depth;
+    if (!played || played == bm) {
+        r.played = bs;
     } else {
-        for (int d = 1; d <= maxDepth; d++) {
-            S->rootBest = 0;
-            int sc = S->negamax(d, -INF, INF, 0, false);
+        // сыгранный ход: та же глубина (depth-1 после хода), полный интервал
+        Undo u;
+        S->b.make(played, u);
+        S->path.push_back(S->b.hash);
+        S->aborted = false;
+        S->start = SDL_GetTicks();
+        S->limit = timeMs * 2 + 200;
+        int v = -evaluate(S->b);
+        for (int d = 0; d <= depth - 1; d++) {
+            int sc = -S->negamax(d, -INF, INF, 1, true);
             if (S->aborted) break;
-            score = sc;
-            bm = S->rootBest;
-            if (std::abs(sc) > MATE - 100) break;
+            v = sc;
         }
-        if (!bm) bm = ml.m[0];
+        r.played = v;
+        // поиск не идеален: если сыгранный ход вышел «лучше лучшего», он и есть лучший
+        if (r.played > r.best) {
+            r.best = r.played;
+            r.bestMove = played;
+        }
     }
     delete S;
-    if (best) *best = bm;
-    return score;
+    return r;
 }
 
 }  // namespace eng
@@ -4228,14 +4290,14 @@ static bool netBusy() { return gNet.state != NS_IDLE || gNet.scan != SOCK_BAD; }
 // Движок оценивает каждую позицию партии. Потеря «шансов на победу» после
 // хода даёт оценку: неточность (?!), ошибка (?) или грубая ошибка (??).
 struct RvJob {
-    std::vector<eng::Board> pos;
+    std::vector<eng::Board> pos;   // позиции 0..n
+    std::vector<eng::Move> moves;  // ходы 0..n-1
     std::vector<uint64_t> hashes;
-    Uint32 per = 100;
+    Uint32 per = 300;              // время на ход (мс)
     std::atomic<bool> stop{false};
-    std::atomic<bool> done{false};
     std::atomic<int> progress{0};
-    std::vector<int> score;
-    std::vector<eng::Move> best;
+    std::atomic<int> running{0};
+    std::vector<eng::MoveVerdict> res;
 };
 struct ReviewData {
     bool ready = false;
@@ -4245,10 +4307,11 @@ struct ReviewData {
     int focus = -1;  // чьи ошибки показывать (-1 — обе стороны)
     bool wb = true;
     std::vector<eng::Board> pos;
+    std::vector<eng::MoveVerdict> res;
     std::vector<int> score;  // оценка позиции i с точки зрения того, кто ходит
     std::vector<eng::Move> best;
     std::vector<int> cls;    // 0 — нормально, 1 ?!, 2 ?, 3 ??
-    std::vector<bool> isBest;
+    std::vector<bool> isBest, book, forced;
     std::vector<int> list;   // номера ходов с ошибками для списка
     int cnt[2][4];
     int acc[2];
@@ -4258,30 +4321,36 @@ struct ReviewData {
 };
 static ReviewData gRv;
 static RvJob *gRvJob = nullptr;
-static SDL_Thread *gRvThread = nullptr;
+static std::vector<SDL_Thread *> gRvThreads;
 static bool gRvDrag = false;
 
-static int SDLCALL rvThreadFn(void *p) {
-    RvJob *j = (RvJob *)p;
-    size_t n = j->pos.size();
-    j->score.assign(n, 0);
-    j->best.assign(n, 0);
-    for (size_t i = 0; i < n && !j->stop.load(); i++) {
-        std::vector<uint64_t> h(j->hashes.begin(), j->hashes.begin() + (long)std::min(i + 1, j->hashes.size()));
-        eng::Move bm = 0;
-        j->score[i] = eng::analyse(j->pos[i], h, j->per, 14, &j->stop, &bm);
-        j->best[i] = bm;
-        j->progress = (int)i + 1;
+struct RvPart {
+    RvJob *job;
+    int from, to;
+};
+// Поток анализа: свой отрезок партии, своя таблица позиций.
+// Идём с конца отрезка: глубокие варианты поздних позиций помогают ранним.
+static int SDLCALL rvWorkerFn(void *p) {
+    RvPart *a = (RvPart *)p;
+    RvJob *j = a->job;
+    int from = a->from, to = a->to;
+    delete a;
+    eng::TTBuf tb;
+    tb.init(18);
+    for (int i = to - 1; i >= from && !j->stop.load(); i--) {
+        std::vector<uint64_t> h(j->hashes.begin(), j->hashes.begin() + i + 1);
+        j->res[(size_t)i] = eng::analyseMove(j->pos[(size_t)i], h, j->moves[(size_t)i], j->per, &j->stop, &tb);
+        j->progress++;
     }
-    j->done = true;
+    j->running--;
     return 0;
 }
 
 static void cancelReview() {
-    if (!gRvThread) return;
+    if (!gRvJob) return;
     gRvJob->stop = true;
-    SDL_WaitThread(gRvThread, nullptr);
-    gRvThread = nullptr;
+    for (auto t : gRvThreads) SDL_WaitThread(t, nullptr);
+    gRvThreads.clear();
     delete gRvJob;
     gRvJob = nullptr;
 }
@@ -4294,42 +4363,95 @@ static float winChance(int cp) {
 static int rvWhiteScore(int i) {
     return gRv.pos[(size_t)i].side == eng::WHITE ? gRv.score[(size_t)i] : -gRv.score[(size_t)i];
 }
+static int rvWhite(int moveIdx, int v) { return gRv.pos[(size_t)moveIdx].side == eng::WHITE ? v : -v; }
+
+// Ход из дебютного справочника (темы обучения «Дебюты»)
+static bool rvIsBook(const Game &g, int i) {
+    static std::vector<std::vector<std::string>> lines;
+    if (lines.empty())
+        for (const auto &p : LP_OPEN2)
+            if (p.mode == LM_GAME && strcmp(p.fen, FEN_START) == 0) lines.push_back(splitWords(p.sol));
+    if (!g.startFen.empty() || i >= 24) return false;
+    for (auto &l : lines) {
+        if ((int)l.size() <= i) continue;
+        bool ok = true;
+        for (int k = 0; k <= i && ok; k++)
+            if (eng::toUCI(g.moves[(size_t)k]) != l[(size_t)k]) ok = false;
+        if (ok) return true;
+    }
+    return false;
+}
+
+static double moveAccuracy(double winLossPct) {
+    double a = 103.1668 * std::exp(-0.04354 * std::max(0.0, winLossPct)) - 3.1669;
+    return std::max(0.0, std::min(100.0, a));
+}
 
 static void rvClassify() {
     size_t n = gRv.g.moves.size();
+    gRv.score.assign(n + 1, 0);
+    gRv.best.assign(n, 0);
+    for (size_t i = 0; i < n; i++) {
+        gRv.score[i] = gRv.res[i].best;
+        gRv.best[i] = gRv.res[i].bestMove;
+    }
+    gRv.score[n] = n ? -gRv.res[n - 1].played : 0;
     gRv.cls.assign(n, 0);
     gRv.isBest.assign(n, false);
+    gRv.book.assign(n, false);
+    gRv.forced.assign(n, false);
     gRv.list.clear();
     memset(gRv.cnt, 0, sizeof(gRv.cnt));
-    double accSum[2] = {0, 0};
-    int accN[2] = {0, 0};
+    std::vector<double> acc(n, 100.0);
     for (size_t i = 0; i < n; i++) {
+        const eng::MoveVerdict &v = gRv.res[i];
         int mover = gRv.pos[i].side;
-        float before = winChance(gRv.score[i]);
-        float after = winChance(-gRv.score[i + 1]);
-        float d = before - after;
-        bool best = gRv.best[i] == gRv.g.moves[i];
-        gRv.isBest[i] = best;
+        bool bk = rvIsBook(gRv.g, (int)i), fo = v.legal == 1;
+        gRv.book[i] = bk;
+        gRv.forced[i] = fo;
+        float d = std::max(0.0f, winChance(v.best) - winChance(v.played));
+        if (bk || fo) d = 0;
+        gRv.isBest[i] = !bk && (v.bestMove == gRv.g.moves[i] || v.played >= v.best);
         int c = 0;
-        if (!best) {
-            if (d >= 0.30f) c = 3;
-            else if (d >= 0.20f) c = 2;
-            else if (d >= 0.10f) c = 1;
-        }
+        if (d >= 0.30f) c = 3;
+        else if (d >= 0.20f) c = 2;
+        else if (d >= 0.10f) c = 1;
         gRv.cls[i] = c;
         gRv.cnt[mover][c]++;
-        float wd = std::max(0.0f, d) * 50.0f;  // потеря в процентах победы
-        double a = 103.1668 * std::exp(-0.04354 * wd) - 3.1669;
-        accSum[mover] += std::max(0.0, std::min(100.0, a));
-        accN[mover]++;
+        acc[i] = moveAccuracy(d * 50.0);
         if (c > 0 && (gRv.focus < 0 || gRv.focus == mover)) gRv.list.push_back((int)i);
     }
+    // Точность как на lichess: среднее, взвешенное по остроте позиции, и гармоническое среднее
+    std::vector<double> wp(n + 1);
+    for (size_t i = 0; i <= n; i++) {
+        int ws = gRv.pos[i].side == eng::WHITE ? gRv.score[i] : -gRv.score[i];
+        wp[i] = 50.0 + 50.0 * winChance(ws);
+    }
+    int win = (int)std::max<size_t>(2, std::min<size_t>(8, n / 10));
+    win = std::min(win, (int)n + 1);
+    double wsum[2] = {0, 0}, wacc[2] = {0, 0}, hsum[2] = {0, 0};
+    int cntc[2] = {0, 0};
+    for (size_t i = 0; i < n; i++) {
+        int st = (int)i < win - 2 ? 0 : (int)i - (win - 2);
+        if (st + win > (int)n + 1) st = (int)n + 1 - win;
+        double mean = 0, var = 0;
+        for (int k = 0; k < win; k++) mean += wp[(size_t)(st + k)];
+        mean /= win;
+        for (int k = 0; k < win; k++) var += (wp[(size_t)(st + k)] - mean) * (wp[(size_t)(st + k)] - mean);
+        double w = std::max(0.5, std::min(12.0, std::sqrt(var / win)));
+        int m = gRv.pos[i].side;
+        wsum[m] += w;
+        wacc[m] += w * acc[i];
+        hsum[m] += 1.0 / std::max(2.0, acc[i]);
+        cntc[m]++;
+    }
     for (int s = 0; s < 2; s++) {
-        gRv.acc[s] = accN[s] ? (int)std::lround(accSum[s] / accN[s]) : 0;
-        // оценка из 10: точность минус штрафы за ошибки
-        double r = gRv.acc[s] / 10.0 - 0.8 * gRv.cnt[s][3] - 0.35 * gRv.cnt[s][2] - 0.1 * gRv.cnt[s][1];
-        if (accN[s] == 0) r = 0;
-        gRv.rate[s] = (int)std::max(1L, std::min(10L, std::lround(r)));
+        double a = 0;
+        if (cntc[s]) a = (wacc[s] / wsum[s] + cntc[s] / hsum[s]) * 0.5;
+        gRv.acc[s] = (int)std::lround(a);
+        // оценка из 10: точность и штраф за грубые ошибки
+        double r = a / 10.0 - 0.5 * gRv.cnt[s][3] - 0.2 * gRv.cnt[s][2] - 0.05 * gRv.cnt[s][1];
+        gRv.rate[s] = cntc[s] ? (int)std::max(1L, std::min(10L, std::lround(r))) : 0;
     }
     gRv.ready = true;
 }
@@ -4344,22 +4466,29 @@ static void startReview() {
     gRv.human = gM.human;
     gRv.focus = gM.mode == MODE_TWO ? -1 : gM.human;
     gRv.wb = gM.mode == MODE_TWO ? true : gM.human == eng::WHITE;
-    size_t n = gRv.g.moves.size();
-    for (size_t i = 0; i < n; i++) gRv.pos.push_back(gRv.g.before[i]);
+    int n = (int)gRv.g.moves.size();
+    for (int i = 0; i < n; i++) gRv.pos.push_back(gRv.g.before[(size_t)i]);
     gRv.pos.push_back(gRv.g.cur);
-    eng::ttClear();
     gRvJob = new RvJob();
     gRvJob->pos = gRv.pos;
+    gRvJob->moves = gRv.g.moves;
     gRvJob->hashes = gRv.g.hashes;
-    gRvJob->per = (Uint32)std::max(50, std::min(250, (int)(14000 / (n + 1))));
-    gRvThread = SDL_CreateThreadWithStackSize(rvThreadFn, "shahreview", 4 * 1024 * 1024, gRvJob);
-    if (!gRvThread) {
-        rvThreadFn(gRvJob);
-        gRv.score = gRvJob->score;
-        gRv.best = gRvJob->best;
-        delete gRvJob;
-        gRvJob = nullptr;
-        rvClassify();
+    gRvJob->res.assign((size_t)n, eng::MoveVerdict());
+    // потоки: на телефоне обычно 8 ядер — берём до 4, оставляя ядро интерфейсу
+    int cpu = SDL_GetCPUCount();
+    int K = cpu >= 4 ? std::min(4, cpu - 1) : std::max(1, cpu);
+    K = std::max(1, std::min(K, n));
+    int wall = std::max(8000, std::min(35000, 4000 + 350 * n));  // общее время анализа, мс
+    gRvJob->per = (Uint32)std::max(120, std::min(3000, (int)(wall * K / (n * 1.7))));
+    gRvJob->running = K;
+    for (int k = 0; k < K; k++) {
+        RvPart *p = new RvPart;
+        p->job = gRvJob;
+        p->from = n * k / K;
+        p->to = n * (k + 1) / K;
+        SDL_Thread *t = SDL_CreateThreadWithStackSize(rvWorkerFn, "shahreview", 4 * 1024 * 1024, p);
+        if (t) gRvThreads.push_back(t);
+        else rvWorkerFn(p);  // без потока — считаем здесь
     }
     gOverlay = OV_NONE;
     clearSel();
@@ -4367,11 +4496,10 @@ static void startReview() {
 }
 
 static void pollReview() {
-    if (gRvThread && gRvJob && gRvJob->done.load()) {
-        SDL_WaitThread(gRvThread, nullptr);
-        gRvThread = nullptr;
-        gRv.score = gRvJob->score;
-        gRv.best = gRvJob->best;
+    if (gRvJob && gRvJob->running.load() == 0) {
+        for (auto t : gRvThreads) SDL_WaitThread(t, nullptr);
+        gRvThreads.clear();
+        gRv.res = gRvJob->res;
         delete gRvJob;
         gRvJob = nullptr;
         rvClassify();
@@ -6332,7 +6460,7 @@ static void drawReview() {
     if (gRv.ready && idx >= 0 && idx < n) {
         eng::Move pm = gRv.g.moves[(size_t)idx], bm = gRv.best[(size_t)idx];
         float x0, y0, x1, y1;
-        if (bm && bm != pm) {
+        if (bm && bm != pm && !gRv.book[(size_t)idx]) {
             rvSqXY(L, eng::mFrom(bm), x0, y0);
             rvSqXY(L, eng::mTo(bm), x1, y1);
             drawArrow(x0 + L.cell * 0.5f, y0 + L.cell * 0.5f, x1 + L.cell * 0.5f, y1 + L.cell * 0.5f, aw, C(40, 170, 70, 190));
@@ -6355,7 +6483,7 @@ static void drawReview() {
     float lh = textH(L.ts) + U * 2;
     if (!gRv.ready) {
         int prog = gRvJob ? gRvJob->progress.load() : 0;
-        int total = n + 1;
+        int total = n;
         text("АНАЛИЗ ПАРТИИ...", W * 0.5f, y, L.ts, COL_TEXT, 1);
         float bw = L.S, bx = (W - bw) * 0.5f, by = y + lh + U * 2;
         fillRRect(bx, by, bw, U * 3, U * 1.5f, C(30, 38, 52));
@@ -6368,20 +6496,27 @@ static void drawReview() {
         int c = gRv.cls[(size_t)idx];
         std::string l1 = moveLabel(idx) + CLS_SYM[c];
         text(l1, L.pad, y, L.ts, clsCol(c));
-        std::string tag = c ? CLS_NAME[c] : (gRv.isBest[(size_t)idx] ? "ЛУЧШИЙ ХОД" : "ХОРОШИЙ ХОД");
-        Col tc = c ? clsCol(c) : C(130, 220, 120);
+        bool bk = gRv.book[(size_t)idx], fo = gRv.forced[(size_t)idx];
+        std::string tag = c ? CLS_NAME[c]
+                            : bk ? "ДЕБЮТНАЯ ТЕОРИЯ"
+                                 : fo ? "ЕДИНСТВЕННЫЙ ХОД" : (gRv.isBest[(size_t)idx] ? "ЛУЧШИЙ ХОД" : "ХОРОШИЙ ХОД");
+        Col tc = c ? clsCol(c) : (bk ? C(140, 196, 255) : C(130, 220, 120));
         int tgs = fitScale(tag, W - 2 * L.pad - textW(l1, L.ts) - U * 4, L.tsS);
         text(tag, W - L.pad, y + textH(L.ts) - textH(tgs), tgs, tc, 2, false);
         y += lh;
-        if (!gRv.isBest[(size_t)idx] && gRv.best[(size_t)idx]) {
+        if (bk) {
+            text("ХОД ИЗ ДЕБЮТНОГО СПРАВОЧНИКА", L.pad, y, L.tsS, C(140, 196, 255), 0, false);
+        } else if (!gRv.isBest[(size_t)idx] && gRv.best[(size_t)idx]) {
             std::string bs = "ЛУЧШЕ: " + eng::toSAN(gRv.pos[(size_t)idx], gRv.best[(size_t)idx]);
             text(bs, L.pad, y, L.tsS, C(130, 220, 120), 0, false);
         } else {
             text("ЭТО ХОД ДВИЖКА", L.pad, y, L.tsS, C(130, 220, 120), 0, false);
         }
         y += textH(L.tsS) + U * 2;
-        std::string ev = "ОЦЕНКА: " + fmtEval(rvWhiteScore(idx)) + " -> " + fmtEval(rvWhiteScore(idx + 1));
+        const eng::MoveVerdict &mv = gRv.res[(size_t)idx];
+        std::string ev = "ОЦЕНКА: " + fmtEval(rvWhite(idx, mv.best)) + " -> " + fmtEval(rvWhite(idx, mv.played));
         text(ev, L.pad, y, L.tsS, COL_DIM, 0, false);
+        text("ГЛУБИНА " + std::to_string(mv.depth), W - L.pad, y, L.tsS, C(110, 118, 132), 2, false);
     }
     // список ошибок
     if (gRv.ready && L.listH > U * 6) {
@@ -7326,7 +7461,7 @@ static void update() {
 
 static bool needsAnimation() {
     if (gPtr.down || gArrowDrag || !gAnims.empty() || botThinking() || gResultPending || gLResetAt || gLReplyAt || gLGAuto) return true;
-    if (gScreen == SC_NET || SDL_GetTicks() < gToastUntil || gRvThread) return true;
+    if (gScreen == SC_NET || SDL_GetTicks() < gToastUntil || gRvJob) return true;
     if (gScreen == SC_GAME && gM.clockInit > 0 && gM.g.result == RES_NONE && !gM.g.moves.empty()) return true;
     return false;
 }
