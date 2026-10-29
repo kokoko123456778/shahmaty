@@ -110,9 +110,12 @@ static const int DIR_R[8] = {0, 0, 1, -1, 1, -1, 1, -1};
 static const int KN_F[8] = {1, 2, 2, 1, -1, -2, -2, -1};
 static const int KN_R[8] = {2, 1, -1, -2, -2, -1, 1, 2};
 
+struct Searcher;
+static void initSearchTables();
 static void init() {
     if (g_inited) return;
     g_inited = true;
+    initSearchTables();
     uint64_t s = 0x5EED1234ABCDULL;
     for (int p = 0; p < 16; p++)
         for (int q = 0; q < 64; q++) zP[p][q] = splitmix(s);
@@ -830,6 +833,12 @@ struct Searcher {
     bool aborted = false;
     std::atomic<bool> *stopFlag = nullptr;
     Move rootBest = 0;
+    static int LMR[64][64];
+    static void initLMR() {
+        for (int d = 0; d < 64; d++)
+            for (int m = 0; m < 64; m++)
+                LMR[d][m] = (d && m) ? (int)(0.75 + std::log((double)d) * std::log((double)m) / 2.25) : 0;
+    }
     TTE *tt = nullptr;  // своя таблица у каждого потока анализа
     uint64_t ttMask = 0;
     TTE ttDummy;
@@ -953,12 +962,16 @@ struct Searcher {
         }
 
         bool pvNode = beta - alpha > 1;
-        // Нулевой ход
-        if (allowNull && !pvNode && !inChk && depth >= 3 && ply > 0 && b.hasNonPawn(b.side) && evaluate(b) >= beta) {
+        int staticEval = inChk ? -INF : evaluate(b);
+        bool quietNode = !pvNode && !inChk && ply > 0;
+        // Обратное отсечение: позиция настолько хороша, что можно не считать дальше
+        if (quietNode && depth <= 6 && std::abs(beta) < MATE - 200 && staticEval - 85 * depth >= beta) return staticEval;
+        // Нулевой ход (сокращение растёт с глубиной)
+        if (allowNull && quietNode && depth >= 3 && b.hasNonPawn(b.side) && staticEval >= beta) {
             Undo u;
             b.makeNull(u);
             path.push_back(b.hash);
-            int s = -negamax(depth - 3, -beta, -beta + 1, ply + 1, false);
+            int s = -negamax(depth - 3 - depth / 6, -beta, -beta + 1, ply + 1, false);
             path.pop_back();
             b.unmakeNull(u);
             if (aborted) return 0;
@@ -973,6 +986,10 @@ struct Searcher {
         Move bestM = 0;
         int legal = 0;
         int origAlpha = alpha;
+        // безнадёжные тихие ходы на малой глубине можно не смотреть
+        static const int FUT[4] = {0, 150, 300, 500};
+        static const int LMP[4] = {0, 7, 12, 18};
+        bool futile = quietNode && depth <= 3 && std::abs(alpha) < MATE - 200 && staticEval + FUT[depth] <= alpha;
         for (int i = 0; i < ml.n; i++) {
             pickNext(ml, sc, i);
             Move m = ml.m[i];
@@ -983,9 +1000,14 @@ struct Searcher {
                 continue;
             }
             legal++;
-            path.push_back(b.hash);
             bool quiet = !(mFlags(m) & F_CAP) && !mPromo(m);
             bool givesCheck = b.inCheck(b.side);
+            if (legal > 1 && quiet && !givesCheck && quietNode && depth <= 3 && (futile || legal > LMP[depth]) &&
+                best > -MATE + 200) {
+                b.unmake(u);
+                continue;
+            }
+            path.push_back(b.hash);
             int s;
             if (legal == 1) {
                 s = -negamax(depth - 1, -beta, -alpha, ply + 1, true);
@@ -993,8 +1015,10 @@ struct Searcher {
                 int red = 0;
                 if (depth >= 3 && legal > 3 && quiet && !inChk && !givesCheck && m != killers[ply][0] &&
                     m != killers[ply][1]) {
-                    red = 1;
-                    if (legal > 10 && depth >= 5) red = 2;
+                    red = LMR[std::min(depth, 63)][std::min(legal, 63)];
+                    if (pvNode && red > 0) red--;
+                    if (red > depth - 2) red = depth - 2;
+                    if (red < 1) red = 1;
                 }
                 s = -negamax(depth - 1 - red, -alpha - 1, -alpha, ply + 1, true);
                 if (!aborted && s > alpha && red) s = -negamax(depth - 1, -alpha - 1, -alpha, ply + 1, true);
@@ -1036,16 +1060,34 @@ struct Searcher {
         return best;
     }
 
+    // Поиск с «окном» вокруг прошлой оценки: быстрее, при промахе окно расширяется
+    int rootSearch(int d, int prev) {
+        if (d < 5 || std::abs(prev) > MATE - 300) return negamax(d, -INF, INF, 0, false);
+        int delta = 35;
+        int a = prev - delta, bb = prev + delta;
+        for (;;) {
+            int s = negamax(d, a, bb, 0, false);
+            if (aborted) return s;
+            if (s > a && s < bb) return s;
+            delta *= 3;
+            if (delta > 900) return negamax(d, -INF, INF, 0, false);
+            if (s <= a) a = std::max(-INF, s - delta);
+            else bb = std::min((int)INF, s + delta);
+        }
+    }
+
     Move iterate(int maxDepth) {
         Move best = 0;
+        int prev = 0;
         for (int d = 1; d <= maxDepth; d++) {
             rootBest = 0;
-            int s = negamax(d, -INF, INF, 0, false);
+            int s = rootSearch(d, prev);
             if (aborted) {
                 if (rootBest && d > 1 && best == 0) best = rootBest;
                 break;
             }
             best = rootBest;
+            prev = s;
             if (std::abs(s) > MATE - 100) break;
             if (limit && SDL_GetTicks() - start > limit * 45 / 100) break;
         }
@@ -1079,6 +1121,9 @@ struct Searcher {
         return best;
     }
 };
+
+int Searcher::LMR[64][64];
+static void initSearchTables() { Searcher::initLMR(); }
 
 // Уровни сложности 1..5
 static Move think(const Board &rb, const std::vector<uint64_t> &hist, int level, Uint32 timeMs, int gamePly,
@@ -1176,7 +1221,7 @@ static MoveVerdict analyseMove(const Board &pos, const std::vector<uint64_t> &hi
     int bs = 0, depth = 0;
     for (int d = 1; d <= MAXPLY - 8; d++) {
         S->rootBest = 0;
-        int sc = S->negamax(d, -INF, INF, 0, false);
+        int sc = S->rootSearch(d, bs);
         if (S->aborted) break;
         bs = sc;
         depth = d;
@@ -4298,6 +4343,11 @@ struct RvJob {
     std::atomic<int> progress{0};
     std::atomic<int> running{0};
     std::vector<eng::MoveVerdict> res;
+    // второй проход: спорные ходы перепроверяются глубже
+    int phase = 1;
+    std::vector<int> cand;
+    std::atomic<int> candNext{0};
+    Uint32 per2 = 900;
 };
 struct ReviewData {
     bool ready = false;
@@ -4323,6 +4373,7 @@ static ReviewData gRv;
 static RvJob *gRvJob = nullptr;
 static std::vector<SDL_Thread *> gRvThreads;
 static bool gRvDrag = false;
+static bool gRvVerify = true;  // второй проход: перепроверка спорных ходов
 
 struct RvPart {
     RvJob *job;
@@ -4340,6 +4391,23 @@ static int SDLCALL rvWorkerFn(void *p) {
     for (int i = to - 1; i >= from && !j->stop.load(); i--) {
         std::vector<uint64_t> h(j->hashes.begin(), j->hashes.begin() + i + 1);
         j->res[(size_t)i] = eng::analyseMove(j->pos[(size_t)i], h, j->moves[(size_t)i], j->per, &j->stop, &tb);
+        j->progress++;
+    }
+    j->running--;
+    return 0;
+}
+
+static int SDLCALL rvCheckFn(void *p) {
+    RvJob *j = (RvJob *)p;
+    eng::TTBuf tb;
+    tb.init(18);
+    for (;;) {
+        int k = j->candNext++;
+        if (k >= (int)j->cand.size() || j->stop.load()) break;
+        int i = j->cand[(size_t)k];
+        std::vector<uint64_t> h(j->hashes.begin(), j->hashes.begin() + i + 1);
+        eng::MoveVerdict v = eng::analyseMove(j->pos[(size_t)i], h, j->moves[(size_t)i], j->per2, &j->stop, &tb);
+        if (!j->stop.load() && v.depth >= j->res[(size_t)i].depth) j->res[(size_t)i] = v;  // берём более глубокий вердикт
         j->progress++;
     }
     j->running--;
@@ -4478,7 +4546,7 @@ static void startReview() {
     int cpu = SDL_GetCPUCount();
     int K = cpu >= 4 ? std::min(4, cpu - 1) : std::max(1, cpu);
     K = std::max(1, std::min(K, n));
-    int wall = std::max(8000, std::min(35000, 4000 + 350 * n));  // общее время анализа, мс
+    int wall = std::max(7000, std::min(30000, 3000 + 300 * n));  // время основного прохода, мс
     gRvJob->per = (Uint32)std::max(120, std::min(3000, (int)(wall * K / (n * 1.7))));
     gRvJob->running = K;
     for (int k = 0; k < K; k++) {
@@ -4499,6 +4567,33 @@ static void pollReview() {
     if (gRvJob && gRvJob->running.load() == 0) {
         for (auto t : gRvThreads) SDL_WaitThread(t, nullptr);
         gRvThreads.clear();
+        RvJob *j = gRvJob;
+        if (j->phase == 1 && gRvVerify) {
+            // спорные ходы: потеря рядом с порогом неточности или больше
+            int n = (int)j->moves.size();
+            for (int i = 0; i < n; i++) {
+                const eng::MoveVerdict &v = j->res[(size_t)i];
+                if (v.legal <= 1 || rvIsBook(gRv.g, i)) continue;
+                if (winChance(v.best) - winChance(v.played) >= 0.06f) j->cand.push_back(i);
+            }
+            if (!j->cand.empty()) {
+                j->phase = 2;
+                int cpu = SDL_GetCPUCount();
+                int K = cpu >= 4 ? std::min(4, cpu - 1) : std::max(1, cpu);
+                K = std::max(1, std::min(K, (int)j->cand.size()));
+                // втрое больше времени на ход, но вся проверка — не дольше ~15 с
+                int c = (int)j->cand.size();
+                int p2 = std::min((int)j->per * 3, 15000 * K / c);
+                j->per2 = (Uint32)std::max(std::max(400, (int)j->per), std::min(4000, p2));
+                j->running = K;
+                for (int k = 0; k < K; k++) {
+                    SDL_Thread *t = SDL_CreateThreadWithStackSize(rvCheckFn, "shahcheck", 4 * 1024 * 1024, j);
+                    if (t) gRvThreads.push_back(t);
+                    else rvCheckFn(j);
+                }
+                return;
+            }
+        }
         gRv.res = gRvJob->res;
         delete gRvJob;
         gRvJob = nullptr;
@@ -6483,8 +6578,9 @@ static void drawReview() {
     float lh = textH(L.ts) + U * 2;
     if (!gRv.ready) {
         int prog = gRvJob ? gRvJob->progress.load() : 0;
-        int total = n;
-        text("АНАЛИЗ ПАРТИИ...", W * 0.5f, y, L.ts, COL_TEXT, 1);
+        int total = n + (gRvJob ? (int)gRvJob->cand.size() : 0);
+        text(gRvJob && gRvJob->phase == 2 ? "ПРОВЕРКА СПОРНЫХ ХОДОВ..." : "АНАЛИЗ ПАРТИИ...", W * 0.5f, y,
+             fitScale("ПРОВЕРКА СПОРНЫХ ХОДОВ...", W - 2 * L.pad, L.ts), COL_TEXT, 1);
         float bw = L.S, bx = (W - bw) * 0.5f, by = y + lh + U * 2;
         fillRRect(bx, by, bw, U * 3, U * 1.5f, C(30, 38, 52));
         fillRRect(bx, by, std::max(U * 3, bw * prog / std::max(1, total)), U * 3, U * 1.5f, COL_GOLD);
