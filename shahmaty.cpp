@@ -158,10 +158,10 @@ static void init() {
 }
 
 struct MoveList {
-    Move m[512];  // с запасом: в своей расстановке может быть много ферзей
+    Move m[1024];  // с запасом: в своей расстановке может быть хоть 30 ферзей
     int n = 0;
     void add(Move x) {
-        if (n < 512) m[n++] = x;
+        if (n < 1024) m[n++] = x;
     }
 };
 
@@ -342,6 +342,7 @@ struct Board {
                 int r = s >> 3, f = s & 7;
                 bool promo = (c == WHITE ? r == 6 : r == 1);
                 int to = s + dir;
+                if (to < 0 || to > 63) continue;  // пешка на последней горизонтали (своя расстановка) стоит
                 if (!sq[to]) {
                     if (promo)
                         addPawn(ml, s, to, 0, true, capsOnly);
@@ -911,7 +912,7 @@ struct Searcher {
         if (stand > alpha) alpha = stand;
         MoveList ml;
         b.gen(ml, true);
-        int sc[512];
+        int sc[1024];
         for (int i = 0; i < ml.n; i++) sc[i] = scoreMove(ml.m[i], 0, ply);
         for (int i = 0; i < ml.n; i++) {
             pickNext(ml, sc, i);
@@ -980,7 +981,7 @@ struct Searcher {
 
         MoveList ml;
         b.gen(ml, false);
-        int sc[512];
+        int sc[1024];
         for (int i = 0; i < ml.n; i++) sc[i] = scoreMove(ml.m[i], ttMove, ply);
         int best = -INF;
         Move bestM = 0;
@@ -3324,6 +3325,12 @@ static void newMatch(int mode, int level, int colorChoice, int clockChoice, cons
     eng::ttClear();
     gScreen = SC_GAME;
     gLastTick = SDL_GetTicks();
+    gM.g.evalEnd();
+    if (gM.g.result != RES_NONE) {  // в своей расстановке уже мат, пат или мало фигур
+        gM.recorded = true;
+        onGameEnd();
+        return;
+    }
     saveAll();
     startBot();
 }
@@ -4691,28 +4698,9 @@ static bool edPlace(int sq, int piece, bool toggle) {
         gEdSq[sq] = 0;
         return true;
     }
-    int t = eng::pType(piece), c = eng::pColor(piece);
-    if (t == eng::PAWN && (sq < 8 || sq >= 56)) {
-        toast("ПЕШКИ НЕ СТОЯТ НА 1 И 8 ГОРИЗОНТАЛИ");
-        return false;
-    }
-    int total = 0, pawns = 0;
-    for (int i = 0; i < 64; i++) {
-        int p = gEdSq[i];
-        if (i == sq || !p || eng::pColor(p) != c) continue;
-        if (t == eng::KING && p == piece) continue;  // старый король уйдёт
-        total++;
-        if (eng::pType(p) == eng::PAWN) pawns++;
-    }
-    if (total >= 16) {
-        toast("НЕ БОЛЬШЕ 16 ФИГУР У СТОРОНЫ");
-        return false;
-    }
-    if (t == eng::PAWN && pawns >= 8) {
-        toast("НЕ БОЛЬШЕ 8 ПЕШЕК У СТОРОНЫ");
-        return false;
-    }
-    if (t == eng::KING)
+    // любое количество фигур и пешек, пешки — на любой горизонтали;
+    // король у каждой стороны один: второй переносится на новую клетку
+    if (eng::pType(piece) == eng::KING)
         for (int i = 0; i < 64; i++)
             if (i != sq && gEdSq[i] == piece) gEdSq[i] = 0;
     gEdSq[sq] = piece;
@@ -4757,18 +4745,15 @@ static bool edCheck(std::string &msg) {
     }
     int other = b.side ^ 1;
     if (b.inCheck(other)) {
-        msg = std::string("ШАХ ") + (other == eng::WHITE ? "БЕЛЫМ" : "ЧЁРНЫМ") + ", А ХОДЯТ " +
-              (b.side == eng::WHITE ? "БЕЛЫЕ" : "ЧЁРНЫЕ");
+        msg = std::string("ШАХ ") + (other == eng::WHITE ? "БЕЛЫМ" : "ЧЁРНЫМ") + " - ХОД ПЕРЕЙДЁТ К НИМ";
         return false;
     }
+    // мат, пат и мало фигур не запрещаем — партия просто сразу закончится
     eng::MoveList ml;
     b.genLegal(ml);
-    if (!ml.n) {
-        msg = b.inCheck(b.side) ? "В ЭТОЙ ПОЗИЦИИ УЖЕ МАТ" : "В ЭТОЙ ПОЗИЦИИ УЖЕ ПАТ";
-        return false;
-    }
-    if (b.insufficient()) { msg = "НЕ ХВАТАЕТ ФИГУР ДЛЯ МАТА"; return false; }
-    msg = "ПОЗИЦИЯ ГОТОВА К ИГРЕ";
+    if (!ml.n) msg = b.inCheck(b.side) ? "ГОТОВО · ЗДЕСЬ УЖЕ МАТ" : "ГОТОВО · ЗДЕСЬ УЖЕ ПАТ";
+    else if (b.insufficient()) msg = "ГОТОВО · НИЧЬЯ: МАЛО ФИГУР ДЛЯ МАТА";
+    else msg = "ПОЗИЦИЯ ГОТОВА К ИГРЕ";
     return true;
 }
 
@@ -6847,7 +6832,7 @@ static void drawOverlay() {
         int s2 = fitScale(r, p.w * 0.9f, ts);
         text(r, p.x + p.w * 0.5f, cy, s2, COL_TEXT, 1, false);
         cy += textH(s2) + U * 3;
-        std::string mv = "ХОДОВ: " + std::to_string((g.moves.size() + g.off() + 1) / 2);
+        std::string mv = "ХОДОВ: " + std::to_string(g.moves.empty() ? 0 : (g.moves.size() + g.off() + 1) / 2);
         text(mv, p.x + p.w * 0.5f, cy, std::max(1, ts - 1), COL_DIM, 1, false);
     } else if (gOverlay == OV_PROMO) {
         Panel p = overlayPanel(50);
@@ -6963,8 +6948,23 @@ static void onButton(int id) {
             break;
         case B_ED_PLAY: {
             std::string m;
-            if (edCheck(m)) gOverlay = OV_CHOOSE;
-            else toast(m);
+            if (!edCheck(m)) {
+                eng::Board b;
+                if (b.setFEN(edFen()) && b.inCheck(b.side ^ 1)) {
+                    gEdSide ^= 1;  // шах тому, кто не ходит: пусть ходит он
+                    std::string m2;
+                    if (edCheck(m2)) {
+                        toast(gEdSide == eng::WHITE ? "ХОД ПЕРЕДАН БЕЛЫМ: ИМ ШАХ" : "ХОД ПЕРЕДАН ЧЁРНЫМ: ИМ ШАХ");
+                        gOverlay = OV_CHOOSE;
+                        break;
+                    }
+                    gEdSide ^= 1;
+                    m = "ШАХ ОБОИМ КОРОЛЯМ СРАЗУ - ТАК НЕЛЬЗЯ";
+                }
+                toast(m);
+                break;
+            }
+            gOverlay = OV_CHOOSE;
             break;
         }
         case B_ED_BOT:
