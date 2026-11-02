@@ -854,6 +854,7 @@ struct Searcher {
         }
     }
 
+    bool stopFlag_set() const { return stopFlag && stopFlag->load(); }
     void checkTime() {
         if (stopFlag && stopFlag->load()) aborted = true;
         if (limit && SDL_GetTicks() - start >= limit) aborted = true;
@@ -1189,12 +1190,105 @@ struct TTBuf {
         mask = ((uint64_t)1 << bits) - 1;
     }
 };
+// ----- Обмен на одном поле (SEE): сколько выиграет сторона by, начав брать на поле s -----
+static const int SEEV[7] = {0, 100, 320, 330, 500, 900, 20000};
+static int lvaSq(const int *sq, int s, int by) {
+    int best = -1, bv = 1 << 30;
+    auto consider = [&](int from) {
+        int v = SEEV[pType(sq[from])];
+        if (v < bv) { bv = v; best = from; }
+    };
+    int f = s & 7;
+    int P = mkPiece(by, PAWN);
+    if (by == WHITE) {
+        if (s >= 8) {
+            if (f > 0 && sq[s - 9] == P) consider(s - 9);
+            if (f < 7 && sq[s - 7] == P) consider(s - 7);
+        }
+    } else if (s < 56) {
+        if (f < 7 && sq[s + 9] == P) consider(s + 9);
+        if (f > 0 && sq[s + 7] == P) consider(s + 7);
+    }
+    if (best >= 0) return best;
+    int N = mkPiece(by, KNIGHT);
+    for (int i = 0; i < knN[s]; i++)
+        if (sq[knT[s][i]] == N) consider(knT[s][i]);
+    int Rk = mkPiece(by, ROOK), Bs = mkPiece(by, BISHOP), Q = mkPiece(by, QUEEN);
+    for (int d = 0; d < 8; d++)
+        for (int i = 0; i < rayLen[s][d]; i++) {
+            int t = rays[s][d][i];
+            int p = sq[t];
+            if (!p) continue;
+            if (p == Q || (d < 4 ? p == Rk : p == Bs)) consider(t);
+            break;
+        }
+    int K = mkPiece(by, KING);
+    for (int i = 0; i < kgN[s]; i++)
+        if (sq[kgT[s][i]] == K) consider(kgT[s][i]);
+    return best;
+}
+static int see(const int *board, int s, int by) {
+    int sq[64];
+    memcpy(sq, board, sizeof(sq));
+    if (!sq[s]) return 0;
+    int gain[40], d = 0;
+    gain[0] = SEEV[pType(sq[s])];
+    int from = lvaSq(sq, s, by);
+    if (from < 0) return 0;
+    if (pType(sq[from]) == KING && lvaSq(sq, s, by ^ 1) >= 0) return 0;  // королём под бой нельзя
+    sq[s] = sq[from];
+    sq[from] = 0;
+    int side = by ^ 1;
+    for (;;) {
+        int f2 = lvaSq(sq, s, side);
+        if (f2 < 0) break;
+        if (pType(sq[f2]) == KING && lvaSq(sq, s, side ^ 1) >= 0) break;
+        d++;
+        gain[d] = SEEV[pType(sq[s])] - gain[d - 1];
+        sq[s] = sq[f2];
+        sq[f2] = 0;
+        side ^= 1;
+        if (d >= 38) break;
+    }
+    while (d > 0) {
+        gain[d - 1] = -std::max(-gain[d - 1], gain[d]);
+        d--;
+    }
+    return gain[0];
+}
+// Сколько материала ход оставляет под боем (жертва), за вычетом взятого им самим
+static int sacrificeValue(const Board &b, Move m) {
+    int mover = b.side, to = mTo(m), fl = mFlags(m);
+    Board a = b;
+    Undo u;
+    a.make(m, u);
+    int captured = (fl & F_EP) ? 100 : ((fl & F_CAP) ? SEEV[pType(b.sq[to])] : 0);
+    if (mPromo(m)) captured += SEEV[mPromo(m)] - 100;
+    int worst = 0;
+    for (int s = 0; s < 64; s++) {
+        int p = a.sq[s];
+        if (!p || pColor(p) != mover || pType(p) == KING) continue;
+        int g = see(a.sq, s, mover ^ 1);
+        if (g <= 0) continue;
+        int prev = 0;  // фигура и раньше висела — это не новая жертва
+        if (s != to && b.sq[s] == p) prev = std::max(0, see(b.sq, s, mover ^ 1));
+        worst = std::max(worst, g - prev);
+    }
+    return worst - captured;
+}
+
 struct MoveVerdict {
     int best = 0;      // оценка лучшего хода (с точки зрения ходящего)
     int played = 0;    // оценка сыгранного хода (с той же точки зрения)
     int depth = 0;     // глубина, на которой сравнивали
     Move bestMove = 0;
     int legal = 0;     // сколько было ходов (1 — вынужденный)
+    bool altOk = false;     // проверка других ходов выполнена
+    bool onlyMove = false;  // все другие ходы заметно хуже (для «замечательных»)
+    bool altCrush = false;  // и без этого хода позиция была бы полностью выиграна
+    bool altMate = false;   // другой ход тоже ведёт к мату
+    int sac = 0;       // сколько материала сыгранный ход оставил под боем
+    int gainNow = 0;   // сколько сыгранный ход сразу выигрывает взятием (очевидное взятие)
 };
 static MoveVerdict analyseMove(const Board &pos, const std::vector<uint64_t> &hist, Move played, Uint32 timeMs,
                                std::atomic<bool> *stop, TTBuf *buf) {
@@ -1252,11 +1346,64 @@ static MoveVerdict analyseMove(const Board &pos, const std::vector<uint64_t> &hi
             if (S->aborted) break;
             v = sc;
         }
+        S->path.pop_back();
+        S->b.unmake(u);  // вернуть доску: дальше ищем другие ходы из исходной позиции
         r.played = v;
         // поиск не идеален: если сыгранный ход вышел «лучше лучшего», он и есть лучший
         if (r.played > r.best) {
             r.best = r.played;
             r.bestMove = played;
+        }
+    }
+    if (played) {
+        r.sac = sacrificeValue(pos, played);
+        if (mFlags(played) & F_CAP) r.gainNow = see(pos.sq, mTo(played), pos.side);
+    }
+    // Другие ходы: есть ли не намного хуже (тогда ход не «единственный»)
+    // и выигрывает ли позиция без него (тогда жертва не «блестящая»)
+    if (played && ml.n > 1 && r.played >= r.best - 40 && !S->stopFlag_set()) {
+        auto wc = [](int cp) { cp = std::max(-1500, std::min(1500, cp)); return 2.0 / (1.0 + std::exp(-0.00368208 * cp)) - 1.0; };
+        auto cpOf = [](double w) {
+            if (w <= -0.999) return -INF + 1;
+            if (w >= 0.999) return 1500;
+            return (int)std::lround(-std::log(2.0 / (w + 1.0) - 1.0) / 0.00368208);
+        };
+        if (played != r.bestMove) {
+            r.altOk = true;
+            r.onlyMove = false;
+            r.altCrush = wc(r.best) >= 0.6;
+            r.altMate = r.best > MATE - 300;
+        } else {
+            int altDepth = std::max(1, std::min(depth - 2, 10));
+            auto anyAtLeast = [&](int thr, bool &ok) {
+                // быстрая проверка с «нулевым окном»: есть ли другой ход не хуже thr
+                S->aborted = false;
+                S->start = SDL_GetTicks();
+                S->limit = timeMs + 150;
+                for (int i = 0; i < ml.n; i++) {
+                    if (ml.m[i] == played) continue;
+                    Undo u;
+                    S->b.make(ml.m[i], u);
+                    S->path.push_back(S->b.hash);
+                    int sc = -S->negamax(altDepth - 1, -thr, -thr + 1, 1, true);
+                    S->path.pop_back();
+                    S->b.unmake(u);
+                    if (S->aborted) { ok = false; return false; }
+                    if (sc >= thr) return true;
+                }
+                return false;
+            };
+            bool ok1 = true, ok2 = true;
+            int thrGreat = cpOf(wc(r.best) - 0.25);
+            r.onlyMove = !anyAtLeast(thrGreat, ok1);
+            r.altCrush = r.altMate = false;
+            bool ok3 = true;
+            if (ok1 && r.sac >= 180) {
+                r.altCrush = anyAtLeast(cpOf(0.6), ok2);  // около +3,8 пешки — «полностью выиграно»
+                if (r.best > MATE - 300) r.altMate = anyAtLeast(MATE - 300, ok3);
+            }
+            r.altOk = ok1 && ok2 && ok3;
+            if (!r.altOk) r.onlyMove = r.altCrush = r.altMate = false;
         }
     }
     delete S;
@@ -4356,6 +4503,15 @@ struct RvJob {
     std::atomic<int> candNext{0};
     Uint32 per2 = 900;
 };
+// Категории ходов, как на chess.com
+enum { MK_NONE = 0, MK_BRILLIANT, MK_GREAT, MK_BEST, MK_EXCELLENT, MK_GOOD, MK_BOOK, MK_FORCED,
+       MK_INACC, MK_MISTAKE, MK_MISS, MK_BLUNDER, MK_COUNT };
+static bool mkKey(int k) { return k == MK_BRILLIANT || k == MK_GREAT || k >= MK_INACC; }
+struct RvRow {
+    int type;  // 0 — заголовок, 1 — строка сводки, 2 — ключевой ход, 3 — пояснение
+    int kind;
+    int idx;
+};
 struct ReviewData {
     bool ready = false;
     Game g;
@@ -4371,6 +4527,9 @@ struct ReviewData {
     std::vector<bool> isBest, book, forced;
     std::vector<int> list;   // номера ходов с ошибками для списка
     int cnt[2][4];
+    std::vector<int> kind;   // категория каждого хода (MK_*)
+    int kcnt[2][MK_COUNT];
+    std::vector<RvRow> rows; // строки нижнего списка
     int acc[2];
     int rate[2];  // общая оценка игры 1..10
     int k = 0;               // показан ход k (1..n), 0 — начало
@@ -4477,6 +4636,8 @@ static void rvClassify() {
     gRv.forced.assign(n, false);
     gRv.list.clear();
     memset(gRv.cnt, 0, sizeof(gRv.cnt));
+    memset(gRv.kcnt, 0, sizeof(gRv.kcnt));
+    gRv.kind.assign(n, MK_GOOD);
     std::vector<double> acc(n, 100.0);
     for (size_t i = 0; i < n; i++) {
         const eng::MoveVerdict &v = gRv.res[i];
@@ -4491,10 +4652,47 @@ static void rvClassify() {
         if (d >= 0.30f) c = 3;
         else if (d >= 0.20f) c = 2;
         else if (d >= 0.10f) c = 1;
+        // --- категория хода
+        int k;
+        const eng::Board &after = gRv.pos[i + 1];
+        eng::MoveList aml;
+        eng::Board tmp = after;
+        tmp.genLegal(aml);
+        bool mateNow = aml.n == 0 && tmp.inCheck(tmp.side);
+        eng::Move mv = gRv.g.moves[i];
+        bool recapture = i > 0 && (eng::mFlags(gRv.g.moves[i - 1]) & eng::F_CAP) && eng::mTo(gRv.g.moves[i - 1]) == eng::mTo(mv);
+        if (bk) k = MK_BOOK;
+        else if (fo) k = MK_FORCED;
+        else if (c >= 1) {
+            k = c == 3 ? MK_BLUNDER : c == 2 ? MK_MISTAKE : MK_INACC;
+            // промах: соперник только что ошибся, а мы это не наказали
+            // (позиция после хода при этом не проиграна — иначе это обычный зевок)
+            if (c >= 2 && i > 0 && gRv.cls[i - 1] >= 2 && winChance(v.played) > -0.3f &&
+                winChance(v.played) >= winChance(-gRv.res[i - 1].best) - 0.1f)
+                k = MK_MISS;
+        } else if (v.best > eng::MATE - 7 && v.played < eng::MATE - 300) {
+            k = MK_MISS;  // упущен быстрый мат
+            c = 1;
+        } else if (v.altOk && v.sac >= 180 && d <= 0.02f && winChance(v.played) >= -0.2f && !mateNow &&
+                   (!v.altCrush || (v.best > eng::MATE - 300 && !v.altMate))) {
+            // жертва фигуры: без неё позиция не была бы выиграна, либо только жертва ведёт к мату
+            k = MK_BRILLIANT;  // жертва фигуры, и это лучший ход
+        } else if (v.altOk && v.onlyMove && gRv.isBest[i] && !mateNow && v.gainNow < 200 && !recapture && v.legal > 2 &&
+                   winChance(v.best) > -0.5f) {
+            k = MK_GREAT;  // единственный сильный ход
+        } else if (gRv.isBest[i]) {
+            k = MK_BEST;
+        } else if (d < 0.04f) {
+            k = MK_EXCELLENT;
+        } else {
+            k = MK_GOOD;
+        }
+        gRv.kind[i] = k;
+        gRv.kcnt[mover][k]++;
         gRv.cls[i] = c;
         gRv.cnt[mover][c]++;
         acc[i] = moveAccuracy(d * 50.0);
-        if (c > 0 && (gRv.focus < 0 || gRv.focus == mover)) gRv.list.push_back((int)i);
+        if (mkKey(k) && (gRv.focus < 0 || gRv.focus == mover)) gRv.list.push_back((int)i);
     }
     // Точность как на lichess: среднее, взвешенное по остроте позиции, и гармоническое среднее
     std::vector<double> wp(n + 1);
@@ -4525,9 +4723,18 @@ static void rvClassify() {
         if (cntc[s]) a = (wacc[s] / wsum[s] + cntc[s] / hsum[s]) * 0.5;
         gRv.acc[s] = (int)std::lround(a);
         // оценка из 10: точность и штраф за грубые ошибки
-        double r = a / 10.0 - 0.5 * gRv.cnt[s][3] - 0.2 * gRv.cnt[s][2] - 0.05 * gRv.cnt[s][1];
+        double r = a / 10.0 - 0.5 * gRv.cnt[s][3] - 0.2 * gRv.cnt[s][2] - 0.05 * gRv.cnt[s][1] +
+                   0.3 * gRv.kcnt[s][MK_BRILLIANT] + 0.15 * gRv.kcnt[s][MK_GREAT];
         gRv.rate[s] = cntc[s] ? (int)std::max(1L, std::min(10L, std::lround(r))) : 0;
     }
+    // строки нижнего списка: ключевые ходы, затем сводка по всем категориям
+    gRv.rows.clear();
+    gRv.rows.push_back({0, 1, -1});
+    for (int i : gRv.list) gRv.rows.push_back({2, gRv.kind[(size_t)i], i});
+    if (gRv.list.empty()) gRv.rows.push_back({3, 0, -1});
+    gRv.rows.push_back({0, 0, -1});
+    for (int k = MK_BRILLIANT; k < MK_COUNT; k++)
+        if (gRv.kcnt[0][k] || gRv.kcnt[1][k]) gRv.rows.push_back({1, k, -1});
     gRv.ready = true;
 }
 
@@ -4581,7 +4788,9 @@ static void pollReview() {
             for (int i = 0; i < n; i++) {
                 const eng::MoveVerdict &v = j->res[(size_t)i];
                 if (v.legal <= 1 || rvIsBook(gRv.g, i)) continue;
-                if (winChance(v.best) - winChance(v.played) >= 0.06f) j->cand.push_back(i);
+                float dd = winChance(v.best) - winChance(v.played);
+                bool special = v.altOk && dd <= 0.03f && (v.onlyMove || v.sac >= 180);  // возможно «!!» или «!»
+                if (dd >= 0.06f || special) j->cand.push_back(i);
             }
             if (!j->cand.empty()) {
                 j->phase = 2;
@@ -5183,7 +5392,7 @@ static void buildScreenButtons() {
             float x = L.pad;
             for (int i = 0; i < 5; i++) {
                 float w = i == 4 ? wM : wS;
-                Btn b = mkBtn(x, L.navY, w, L.navH, ids[i], i == 4 ? "СЛЕД. ОШИБКА" : "", i == 4 ? ST_NORMAL : ST_TOOL, ts);
+                Btn b = mkBtn(x, L.navY, w, L.navH, ids[i], i == 4 ? "ВАЖНЫЙ ХОД" : "", i == 4 ? ST_NORMAL : ST_TOOL, ts);
                 b.icon = ics[i];
                 if (i < 2) b.enabled = gRv.k > 0;
                 else if (i < 4) b.enabled = gRv.k < n;
@@ -6420,16 +6629,81 @@ static void drawToast() {
 }
 
 // ---------- экран разбора партии ----------
-static const char *CLS_SYM[4] = {"", "?!", "?", "??"};
-static const char *CLS_NAME[4] = {"", "НЕТОЧНОСТЬ", "ОШИБКА", "ГРУБАЯ ОШИБКА"};
-static Col clsCol(int c) {
-    switch (c) {
-        case 1: return C(240, 210, 90);
-        case 2: return C(245, 150, 70);
-        case 3: return C(240, 90, 80);
+// ----- категории ходов: названия, цвета, значки -----
+static const char *MK_NAME[MK_COUNT] = {"", "БЛЕСТЯЩИЙ ХОД", "ЗАМЕЧАТЕЛЬНЫЙ ХОД", "ЛУЧШИЙ ХОД", "ОТЛИЧНЫЙ ХОД",
+                                        "ХОРОШИЙ ХОД", "ТЕОРИЯ", "ВЫНУЖДЕННЫЙ ХОД", "НЕТОЧНОСТЬ", "ОШИБКА",
+                                        "ПРОМАХ", "ЗЕВОК"};
+static const char *MK_PLURAL[MK_COUNT] = {"", "БЛЕСТЯЩИЕ", "ЗАМЕЧАТЕЛЬНЫЕ", "ЛУЧШИЕ", "ОТЛИЧНЫЕ", "ХОРОШИЕ",
+                                          "ТЕОРИЯ", "ВЫНУЖДЕННЫЕ", "НЕТОЧНОСТИ", "ОШИБКИ", "ПРОМАХИ", "ЗЕВКИ"};
+static const char *MK_SUFFIX[MK_COUNT] = {"", "!!", "!", "", "", "", "", "", "?!", "?", "", "??"};
+static Col mkCol(int k) {
+    switch (k) {
+        case MK_BRILLIANT: return C(38, 194, 186);
+        case MK_GREAT: return C(92, 139, 196);
+        case MK_BEST: return C(129, 182, 76);
+        case MK_EXCELLENT: return C(110, 176, 80);
+        case MK_GOOD: return C(140, 168, 128);
+        case MK_BOOK: return C(170, 132, 96);
+        case MK_FORCED: return C(140, 146, 158);
+        case MK_INACC: return C(240, 196, 60);
+        case MK_MISTAKE: return C(245, 150, 60);
+        case MK_MISS: return C(240, 110, 96);
+        case MK_BLUNDER: return C(232, 60, 48);
         default: return COL_TEXT;
     }
 }
+// значок категории: цветной кружок с символом
+static void drawBadge(int k, float cx, float cy, float r) {
+    if (k <= MK_NONE || k >= MK_COUNT) return;
+    Col c = mkCol(k), w = C(255, 255, 255);
+    fillCircle(cx, cy + r * 0.12f, r, C(0, 0, 0, 90));
+    fillCircle(cx, cy, r, mix(c, C(0, 0, 0), 0.25f));
+    fillCircle(cx, cy, r * 0.88f, c);
+    float lw = std::max(1.5f, r * 0.2f);
+    switch (k) {
+        case MK_BEST: {  // звезда
+            Poly st;
+            for (int i = 0; i < 10; i++) {
+                float a = -1.5707963f + i * 0.6283185f;
+                float rr = (i & 1) ? r * 0.27f : r * 0.62f;
+                st.push_back(P(cx + std::cos(a) * rr, cy + std::sin(a) * rr));
+            }
+            fillPoly(st, solid(w));
+            break;
+        }
+        case MK_EXCELLENT:
+        case MK_GOOD:  // галочка
+            thickLine(cx - r * 0.42f, cy + r * 0.02f, cx - r * 0.1f, cy + r * 0.34f, lw, w);
+            thickLine(cx - r * 0.1f, cy + r * 0.34f, cx + r * 0.46f, cy - r * 0.32f, lw, w);
+            break;
+        case MK_BOOK: {  // раскрытая книжка
+            fillRect(cx - r * 0.5f, cy - r * 0.34f, r * 0.46f, r * 0.68f, w);
+            fillRect(cx + r * 0.04f, cy - r * 0.34f, r * 0.46f, r * 0.68f, w);
+            break;
+        }
+        case MK_FORCED: {  // стрелка
+            thickLine(cx - r * 0.45f, cy, cx + r * 0.15f, cy, lw, w);
+            Poly t;
+            t.push_back(P(cx + r * 0.5f, cy));
+            t.push_back(P(cx + r * 0.08f, cy - r * 0.36f));
+            t.push_back(P(cx + r * 0.08f, cy + r * 0.36f));
+            fillConvex(t, solid(w));
+            break;
+        }
+        case MK_MISS:  // крестик
+            thickLine(cx - r * 0.36f, cy - r * 0.36f, cx + r * 0.36f, cy + r * 0.36f, lw, w);
+            thickLine(cx + r * 0.36f, cy - r * 0.36f, cx - r * 0.36f, cy + r * 0.36f, lw, w);
+            break;
+        default: {  // !! ! ?! ? ??
+            std::string t = MK_SUFFIX[k];
+            int sc = std::max(1, (int)(r * 1.15f / 7));
+            while (sc > 1 && textW(t, sc) > r * 1.5f) sc--;
+            text(t, cx + sc * 0.5f, cy - textH(sc) * 0.5f, sc, w, 1, false);
+            break;
+        }
+    }
+}
+
 static std::string moveLabel(int i) {
     std::string san = gRv.g.san[(size_t)i];
     int p = i + gRv.g.off();
@@ -6443,6 +6717,10 @@ static std::string fmtEval(int whiteScore) {
     char b[32];
     snprintf(b, sizeof b, "%+.1f", whiteScore / 100.0);
     return b;
+}
+static std::string rvWho(int s) {
+    if (gRv.mode == MODE_TWO) return s == eng::WHITE ? "БЕЛЫЕ" : "ЧЁРНЫЕ";
+    return s == gRv.human ? "ВЫ" : (gRv.mode == MODE_BOT ? "БОТ" : "СОПЕРНИК");
 }
 
 static void rvSqXY(const RvLayout &L, int s, float &x, float &y) {
@@ -6489,19 +6767,25 @@ static void drawReview() {
         fillRRect(bx, by, bw, bh, bh * 0.5f, C(255, 255, 255, 18));
         text(line, W * 0.5f, L.rateY, rs, lc, 1);
     }
-    // итоги по сторонам
+    // итоги по сторонам: оценка, точность и значки ключевых категорий
     if (gRv.ready) {
         float y = L.sumY;
+        static const int SUMK[6] = {MK_BRILLIANT, MK_GREAT, MK_INACC, MK_MISTAKE, MK_MISS, MK_BLUNDER};
         for (int s = 0; s < 2; s++) {
-            std::string who = gRv.mode == MODE_TWO ? sideName(s, true) : (s == gRv.human ? "ВЫ" : (gRv.mode == MODE_BOT ? "БОТ" : "СОПЕРНИК"));
-            std::string a = who + ": " + std::to_string(gRv.rate[s]) + "/10 · ТОЧНОСТЬ " + std::to_string(gRv.acc[s]) + "%";
-            float x = L.pad;
-            text(a, x, y, L.tsS, s == gRv.focus || gRv.focus < 0 ? COL_TEXT : COL_DIM, 0, false);
-            x = W - L.pad;
-            for (int c = 3; c >= 1; c--) {
-                std::string t = std::string(CLS_SYM[c]) + " " + std::to_string(gRv.cnt[s][c]);
-                text(t, x, y, L.tsS, clsCol(c), 2, false);
-                x -= textW(t, L.tsS) + U * 4;
+            std::string a = rvWho(s) + " " + std::to_string(gRv.rate[s]) + "/10 · " + std::to_string(gRv.acc[s]) + "%";
+            float br = textH(L.tsS) * 0.62f;
+            float badgesW = 0;  // сколько места займут значки справа
+            for (int q = 0; q < 6; q++) badgesW += textW(std::to_string(gRv.kcnt[s][SUMK[q]]), L.tsS) + U * 3.8f + 2 * br;
+            int as = fitScale(a, W - 2 * L.pad - badgesW - U * 2, L.tsS);
+            text(a, L.pad, y + (textH(L.tsS) - textH(as)) * 0.5f, as, s == gRv.focus || gRv.focus < 0 ? COL_TEXT : COL_DIM, 0, false);
+            float x = W - L.pad;
+            for (int q = 5; q >= 0; q--) {
+                int k = SUMK[q];
+                std::string t = std::to_string(gRv.kcnt[s][k]);
+                text(t, x, y, L.tsS, gRv.kcnt[s][k] ? COL_TEXT : C(100, 106, 118), 2, false);
+                x -= textW(t, L.tsS) + U * 1.2f + br;
+                drawBadge(k, x, y + textH(L.tsS) * 0.5f, br);
+                x -= br + U * 2.6f;
             }
             y += textH(L.tsS) + U * 2;
         }
@@ -6539,17 +6823,17 @@ static void drawReview() {
     float aw = std::max(3.0f, L.cell * 0.15f);
     if (gRv.ready && idx >= 0 && idx < n) {
         eng::Move pm = gRv.g.moves[(size_t)idx], bm = gRv.best[(size_t)idx];
+        int k = gRv.kind[(size_t)idx];
         float x0, y0, x1, y1;
-        if (bm && bm != pm && !gRv.book[(size_t)idx]) {
+        if (bm && bm != pm && k != MK_BOOK && !gRv.isBest[(size_t)idx]) {
             rvSqXY(L, eng::mFrom(bm), x0, y0);
             rvSqXY(L, eng::mTo(bm), x1, y1);
             drawArrow(x0 + L.cell * 0.5f, y0 + L.cell * 0.5f, x1 + L.cell * 0.5f, y1 + L.cell * 0.5f, aw, C(40, 170, 70, 190));
         }
         rvSqXY(L, eng::mFrom(pm), x0, y0);
         rvSqXY(L, eng::mTo(pm), x1, y1);
-        int c = gRv.cls[(size_t)idx];
-        Col ac = c == 0 ? C(70, 130, 230, 170) : withA(clsCol(c), 200);
-        drawArrow(x0 + L.cell * 0.5f, y0 + L.cell * 0.5f, x1 + L.cell * 0.5f, y1 + L.cell * 0.5f, aw, ac);
+        drawArrow(x0 + L.cell * 0.5f, y0 + L.cell * 0.5f, x1 + L.cell * 0.5f, y1 + L.cell * 0.5f, aw, withA(mkCol(k), 200));
+        drawBadge(k, x1 + L.cell * 0.84f, y1 + L.cell * 0.16f, L.cell * 0.22f);  // значок на поле, куда пошли
     }
     // шкала оценки
     if (gRv.ready) {
@@ -6572,83 +6856,110 @@ static void drawReview() {
         text(std::to_string(prog * 100 / std::max(1, total)) + "%", W * 0.5f, by + U * 5, L.tsS, COL_DIM, 1, false);
     } else if (idx < 0) {
         text("НАЧАЛО ПАРТИИ", L.pad, y, L.ts, COL_TEXT);
-        text("ЛИСТАЙТЕ ХОДЫ ИЛИ ВЫБЕРИТЕ ОШИБКУ НИЖЕ", L.pad, y + lh, fitScale("ЛИСТАЙТЕ ХОДЫ ИЛИ ВЫБЕРИТЕ ОШИБКУ НИЖЕ", W - 2 * L.pad, L.tsS), COL_DIM, 0, false);
+        std::string h = "ЛИСТАЙТЕ ХОДЫ ИЛИ ВЫБЕРИТЕ ХОД НИЖЕ";
+        text(h, L.pad, y + lh, fitScale(h, W - 2 * L.pad, L.tsS), COL_DIM, 0, false);
     } else {
-        int c = gRv.cls[(size_t)idx];
-        std::string l1 = moveLabel(idx) + CLS_SYM[c];
-        text(l1, L.pad, y, L.ts, clsCol(c));
-        bool bk = gRv.book[(size_t)idx], fo = gRv.forced[(size_t)idx];
-        std::string tag = c ? CLS_NAME[c]
-                            : bk ? "ДЕБЮТНАЯ ТЕОРИЯ"
-                                 : fo ? "ЕДИНСТВЕННЫЙ ХОД" : (gRv.isBest[(size_t)idx] ? "ЛУЧШИЙ ХОД" : "ХОРОШИЙ ХОД");
-        Col tc = c ? clsCol(c) : (bk ? C(140, 196, 255) : C(130, 220, 120));
-        int tgs = fitScale(tag, W - 2 * L.pad - textW(l1, L.ts) - U * 4, L.tsS);
-        text(tag, W - L.pad, y + textH(L.ts) - textH(tgs), tgs, tc, 2, false);
+        int k = gRv.kind[(size_t)idx];
+        Col kc = mkCol(k);
+        float br = textH(L.ts) * 0.6f;
+        drawBadge(k, L.pad + br, y + textH(L.ts) * 0.5f, br);
+        std::string l1 = moveLabel(idx) + MK_SUFFIX[k];
+        float tx = L.pad + br * 2 + U * 2;
+        text(l1, tx, y, L.ts, k == MK_BEST || k == MK_EXCELLENT || k == MK_GOOD ? COL_TEXT : kc);
+        std::string tag = MK_NAME[k];
+        int tgs = fitScale(tag, W - L.pad - tx - textW(l1, L.ts) - U * 4, L.tsS);
+        text(tag, W - L.pad, y + textH(L.ts) - textH(tgs), tgs, kc, 2, false);
         y += lh;
-        if (bk) {
-            text("ХОД ИЗ ДЕБЮТНОГО СПРАВОЧНИКА", L.pad, y, L.tsS, C(140, 196, 255), 0, false);
-        } else if (!gRv.isBest[(size_t)idx] && gRv.best[(size_t)idx]) {
-            std::string bs = "ЛУЧШЕ: " + eng::toSAN(gRv.pos[(size_t)idx], gRv.best[(size_t)idx]);
-            text(bs, L.pad, y, L.tsS, C(130, 220, 120), 0, false);
-        } else {
-            text("ЭТО ХОД ДВИЖКА", L.pad, y, L.tsS, C(130, 220, 120), 0, false);
-        }
-        y += textH(L.tsS) + U * 2;
         const eng::MoveVerdict &mv = gRv.res[(size_t)idx];
+        std::string bestSan = gRv.best[(size_t)idx] ? eng::toSAN(gRv.pos[(size_t)idx], gRv.best[(size_t)idx]) : "";
+        std::string d2;
+        Col c2 = C(130, 220, 120);
+        switch (k) {
+            case MK_BRILLIANT: d2 = "ЖЕРТВА МАТЕРИАЛА - И ЭТО ЛУЧШИЙ ХОД!"; c2 = kc; break;
+            case MK_GREAT: d2 = "ЕДИНСТВЕННЫЙ СИЛЬНЫЙ ХОД В ПОЗИЦИИ!"; c2 = kc; break;
+            case MK_BEST: d2 = "ЭТО ХОД ДВИЖКА"; break;
+            case MK_BOOK: d2 = "ХОД ИЗ ДЕБЮТНОГО СПРАВОЧНИКА"; c2 = kc; break;
+            case MK_FORCED: d2 = "ДРУГИХ ХОДОВ НЕ БЫЛО"; c2 = COL_DIM; break;
+            case MK_MISS:
+                d2 = (mv.best > eng::MATE - 300 ? "УПУЩЕН МАТ: " : "УПУЩЕНА ВЫГОДА: ") + bestSan;
+                break;
+            default: d2 = bestSan.empty() ? "" : "ЛУЧШЕ: " + bestSan; break;
+        }
+        text(d2, L.pad, y, fitScale(d2, W - 2 * L.pad, L.tsS), c2, 0, false);
+        y += textH(L.tsS) + U * 2;
         std::string ev = "ОЦЕНКА: " + fmtEval(rvWhite(idx, mv.best)) + " -> " + fmtEval(rvWhite(idx, mv.played));
         text(ev, L.pad, y, L.tsS, COL_DIM, 0, false);
         text("ГЛУБИНА " + std::to_string(mv.depth), W - L.pad, y, L.tsS, C(110, 118, 132), 2, false);
     }
-    // список ошибок
+    // нижний список: ключевые ходы и сводка по категориям
     if (gRv.ready && L.listH > U * 6) {
         fillRRect(L.pad, L.listY, W - 2 * L.pad, L.listH, U * 2.2f, C(22, 28, 40, 220));
-        std::string hdr = gRv.focus < 0 ? "ОШИБКИ В ПАРТИИ" : "ВАШИ ОШИБКИ";
-        text(hdr, L.pad + U * 3, L.listY + U * 2, L.tsS, COL_GOLD, 0, false);
-        float ly0 = L.listY + U * 3 + textH(L.tsS) + U * 2;
+        float ly0 = L.listY + U * 2;
         float rh = L.rowH;
         float areaH = L.listY + L.listH - ly0 - U * 1.5f;
-        float total = gRv.list.size() * rh;
+        float total = gRv.rows.size() * rh;
         float maxS = std::max(0.0f, total - areaH);
         if (gRv.scroll > maxS) gRv.scroll = maxS;
         if (gRv.scroll < 0) gRv.scroll = 0;
-        if (gRv.list.empty()) {
-            drawTextBlock("ОШИБОК НЕ НАЙДЕНО. ОТЛИЧНАЯ ИГРА!", L.pad + U * 3, ly0, W - 2 * L.pad - U * 6, L.tsS, C(130, 220, 120), 0);
-        } else {
-            SDL_Rect clip;
-            clip.x = (int)L.pad;
-            clip.y = (int)ly0;
-            clip.w = (int)(W - 2 * L.pad);
-            clip.h = (int)std::max(1.0f, areaH);
-            SDL_RenderSetClipRect(R, &clip);
-            float ry = ly0 - gRv.scroll;
-            for (int i : gRv.list) {
-                if (ry + rh > ly0 && ry < ly0 + areaH) {
-                    int c = gRv.cls[(size_t)i];
-                    if (i == idx) fillRRect(L.pad + U * 1.5f, ry - U * 0.8f, W - 2 * L.pad - U * 3, rh - U * 0.4f, U, C(255, 255, 255, 22));
-                    std::string a = moveLabel(i) + CLS_SYM[c];
-                    text(a, L.pad + U * 3, ry, L.tsS, clsCol(c), 0, false);
-                    if (gRv.best[(size_t)i]) {
-                        std::string bb = "ЛУЧШЕ " + eng::toSAN(gRv.pos[(size_t)i], gRv.best[(size_t)i]);
-                        text(bb, W - L.pad - U * 3, ry, L.tsS, C(130, 200, 120), 2, false);
+        SDL_Rect clip;
+        clip.x = (int)L.pad;
+        clip.y = (int)ly0;
+        clip.w = (int)(W - 2 * L.pad);
+        clip.h = (int)std::max(1.0f, areaH);
+        SDL_RenderSetClipRect(R, &clip);
+        float ry = ly0 - gRv.scroll;
+        float br = textH(L.tsS) * 0.62f;
+        float xL = L.pad + U * 3, xR = W - L.pad - U * 3;
+        float colW = std::max((float)textW("СОПЕРНИК", L.tsS), (float)textW("ЧЁРНЫЕ", L.tsS)) + U * 2;
+        for (auto &row : gRv.rows) {
+            if (ry + rh > ly0 && ry < ly0 + areaH) {
+                float cy = ry + textH(L.tsS) * 0.5f;
+                if (row.type == 0) {
+                    std::string h = row.kind == 1 ? (gRv.focus < 0 ? "КЛЮЧЕВЫЕ ХОДЫ" : "ВАШИ КЛЮЧЕВЫЕ ХОДЫ") : "ВСЕ ОЦЕНКИ ХОДОВ";
+                    text(h, xL, ry, L.tsS, COL_GOLD, 0, false);
+                    if (row.kind == 0) {
+                        text(rvWho(eng::BLACK), xR, ry, L.tsS, COL_DIM, 2, false);
+                        text(rvWho(eng::WHITE), xR - colW, ry, L.tsS, COL_DIM, 2, false);
                     }
+                } else if (row.type == 1) {
+                    drawBadge(row.kind, xL + br, cy, br);
+                    text(MK_PLURAL[row.kind], xL + br * 2 + U * 2, ry, L.tsS, COL_TEXT, 0, false);
+                    for (int sd = 0; sd < 2; sd++) {
+                        int v = gRv.kcnt[sd][row.kind];
+                        text(std::to_string(v), sd ? xR : xR - colW, ry, L.tsS, v ? mkCol(row.kind) : C(100, 106, 118), 2, false);
+                    }
+                } else if (row.type == 2) {
+                    int i = row.idx;
+                    if (i == idx) fillRRect(L.pad + U * 1.5f, ry - U * 0.8f, W - 2 * L.pad - U * 3, rh - U * 0.4f, U, C(255, 255, 255, 22));
+                    drawBadge(row.kind, xL + br, cy, br);
+                    std::string a = moveLabel(i) + MK_SUFFIX[row.kind];
+                    if (gRv.focus < 0) a = std::string(gRv.pos[(size_t)i].side == eng::WHITE ? "Б " : "Ч ") + a;
+                    text(a, xL + br * 2 + U * 2, ry, L.tsS, mkCol(row.kind), 0, false);
+                    std::string rt;
+                    if (row.kind == MK_BRILLIANT || row.kind == MK_GREAT) rt = MK_NAME[row.kind];
+                    else if (gRv.best[(size_t)i]) rt = "ЛУЧШЕ " + eng::toSAN(gRv.pos[(size_t)i], gRv.best[(size_t)i]);
+                    text(rt, xR, ry, L.tsS, row.kind == MK_BRILLIANT || row.kind == MK_GREAT ? mkCol(row.kind) : C(130, 200, 120), 2, false);
+                } else {
+                    text("ОШИБОК НЕ НАЙДЕНО. ОТЛИЧНАЯ ИГРА!", xL, ry, fitScale("ОШИБОК НЕ НАЙДЕНО. ОТЛИЧНАЯ ИГРА!", xR - xL, L.tsS),
+                         C(130, 220, 120), 0, false);
                 }
-                ry += rh;
             }
-            SDL_RenderSetClipRect(R, nullptr);
+            ry += rh;
         }
+        SDL_RenderSetClipRect(R, nullptr);
     }
     drawButtons(gScreenBtns, gOverlay == OV_NONE);
 }
 
-// какая строка списка ошибок под пальцем
+// какой ход в нижнем списке под пальцем
 static int rvListHit(float x, float y) {
     RvLayout L = rvLayout();
     float U = uiU();
-    float ly0 = L.listY + U * 3 + textH(L.tsS) + U * 2;
+    float ly0 = L.listY + U * 2;
     if (x < L.pad || x > gW - L.pad || y < ly0 || y > L.listY + L.listH) return -1;
     int r = (int)std::floor((y - ly0 + gRv.scroll + U * 0.8f) / L.rowH);
-    if (r < 0 || r >= (int)gRv.list.size()) return -1;
-    return gRv.list[(size_t)r];
+    if (r < 0 || r >= (int)gRv.rows.size()) return -1;
+    return gRv.rows[(size_t)r].type == 2 ? gRv.rows[(size_t)r].idx : -1;
 }
 
 // ---------- экран расстановки фигур ----------
