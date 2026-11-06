@@ -62,6 +62,7 @@ jobs:
           sed -i -E "s#applicationId ['\"]org\.libsdl\.app['\"]#applicationId \"$APP_ID\"#" app/build.gradle
           # в шаблоне SDL нет applicationId (он берётся из namespace org.libsdl.app, и все игры получались одним приложением): задаём свой
           grep -q applicationId app/build.gradle || sed -i "0,/defaultConfig {/s//defaultConfig {\n        applicationId \"$APP_ID\"/" app/build.gradle
+          sed -i "s/abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'/abiFilters 'armeabi-v7a', 'arm64-v8a'/" app/build.gradle   # x86-телефонов почти нет: APK вдвое меньше и качается быстрее
           sed -i -E "s#(<string name=\"app_name\">)[^<]*(</string>)#\1$APP_LABEL\2#" app/src/main/res/values/strings.xml
           # рисовать на весь экран, в том числе под вырезом камеры (иначе справа остаётся чёрная полоса)
           ACT=app/src/main/java/org/libsdl/app/SDLActivity.java
